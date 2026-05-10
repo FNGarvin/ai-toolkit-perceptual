@@ -34,6 +34,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv for fast Python package management
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Install nodejs
 WORKDIR /tmp
 RUN curl -sL https://deb.nodesource.com/setup_23.x -o nodesource_setup.sh && \
@@ -49,7 +53,7 @@ WORKDIR /app
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
 # install pytorch before cache bust to avoid redownloading pytorch
-RUN pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
+RUN uv pip install --system --break-system-packages torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 
 # Fix cache busting by moving CACHEBUST to right before git clone
 ARG CACHEBUST=1234
@@ -65,8 +69,8 @@ WORKDIR /app/ai-toolkit
 COPY requirements.txt /app/ai-toolkit/requirements.txt
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt && \
-    pip install setuptools==69.5.1 --no-cache-dir --break-system-packages
+RUN uv pip install --system --break-system-packages -r requirements.txt && \
+    uv pip install --system --break-system-packages setuptools==69.5.1
 
 # Build UI
 WORKDIR /app/ai-toolkit/ui
