@@ -1,292 +1,492 @@
-# AI Toolkit - Perceptual Anchoring Fork
+# Perceptual LoRA Toolkit
 
-A fork of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** for identity-aware LoRA training. Frozen perception models (ArcFace, ViTPose) compare the training model's predictions against reference images, anchoring the output to preserve a person's face and body proportions. Face suppression can dampen or eliminate face learning entirely — useful for training style or clothing LoRAs without memorizing the faces in the dataset.
+An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
 
 **Supported models:** SDXL, FLUX.2 Klein 9B
 
+## Contents
+
+- [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
+- [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
+- [Reg Dataset Semantics](#reg-dataset-semantics): how reg samples are treated in this extension
+- [Training Metrics](#training-metrics): what gets logged each step
+- [Training Previews](#training-previews): what each anchor saves to disk
+- [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
+- [Example: Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
+- [Example: Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
+- [Example: Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
+- [Configuration Reference](#configuration-reference): every extension-specific config option
+- [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
+- [Installation](#installation)
+
 ## Perceptual Anchoring
 
-Perceptual anchoring works by running frozen perception models on the training model's predicted output at each step and comparing the result against cached reference embeddings from the training images. The difference drives an auxiliary loss that anchors the model to preserve specific perceptual attributes.
+The standard LoRA training loss is per-pixel MSE in latent space. It tells the model "match this exact image." On small datasets that turns into a strong instruction to memorize, which is why you often see washed-out colors, baked-in lighting, and "burn-in" (stippling, JPEG ghosts) showing up in every generation.
 
-### Identity Anchor (ArcFace)
-Compares face embeddings between the model's predicted output and reference training images. The LoRA learns to preserve facial identity across poses, lighting, and expressions.
+Perceptual anchors give the LoRA more targeted guidance. Each one is a frozen vision model that scores a single property of the generated image, like its depth or its facial identity, and the LoRA gets rewarded for matching the training images on that property alone. You pick which properties matter for what you're training.
 
-- Uses ArcFace (InsightFace) for 512-dim face embeddings
-- Embeddings are extracted once and cached per image
-- Configurable timestep window and cosine similarity threshold
-- Per-dataset weight overrides for mixed portrait/full-body datasets
-- Recommended weight: **0.01 - 0.1**
+```mermaid
+flowchart TD
+    LegendNote["∇ = gradients flow back<br/>along this edge during backprop"]
+    GT([Training image])
+    LegendNote ~~~ GT
+    GT --> Encode[VAE encode]
+    Encode --> Z0[Clean latent z₀]
+    Z0 --> Noise[Add noise at step t]
+    Noise --> Zt[Noisy latent z_t]
+    Zt --> Model[/LoRA model/]
+    Model <-->|∇| Zhat[Predicted z₀']
 
-### Body Proportion Anchor (ViTPose)
-Compares pose-invariant bone-length ratios (limb lengths, torso ratio) between predicted and reference images. Prevents the model from distorting body shape when generating different poses.
+    Z0 -.-> Diff["Diffusion loss<br/>(MSE in latent space)"]
+    Zhat <-.->|∇| Diff
 
-- Uses ViTPose Plus Base for 17-keypoint pose estimation
-- Computes 8 pose-invariant ratios (arm/leg/torso proportions)
-- MediaPipe person detector for automatic person cropping
-- Recommended weight: **0.1 - 0.2**
+    subgraph Perceptual["Perceptual anchor path (this extension)"]
+        Decode[VAE decode]
+        RGBp[Predicted RGB]
+        Pp["Frozen perceptor<br/>(DA2 / ArcFace / ViTPose)"]
+        Pg[Same frozen perceptor]
+        Anchor["Perceptual anchor loss<br/>(compares predicted vs. clean ground truth perceptor outputs,<br/>not pixels)"]
+    end
 
-### Face Suppression
-Downweights the diffusion loss inside detected face bounding boxes, reducing or eliminating the model's ability to memorize faces from the training data. Use this as a standalone setting when you want to train on a dataset without learning the faces in it — for example, training a style or clothing LoRA while preventing it from reproducing the faces of people in the images.
+    Zhat <-->|∇| Decode
+    Decode <-->|∇| RGBp
+    RGBp <-->|∇| Pp
+    GT --> Pg
+    Pp <-.->|∇| Anchor
+    Pg -.-> Anchor
 
-- Set globally in `face_id.face_suppression_weight` or per-dataset
-- `0` = no suppression (normal), `0.5` = half face learning, `1` = full suppression (no face learning)
-- Per-dataset overrides take priority over the global value
-- Requires face detection (automatically enabled when any face_id feature is active)
+    Diff --> Total((Total loss))
+    Anchor --> Total
 
-### Quick Start
+    classDef frozen fill:#e8eaf6,stroke:#3949ab,color:#1a237e
+    classDef trainable fill:#fff8e1,stroke:#f57c00,color:#e65100
+    classDef loss fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef anchor fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef legendNode fill:#fafafa,stroke:#bbb,color:#555,stroke-dasharray:3 3
 
-All models download automatically on first use (~250MB ArcFace, ~350MB ViTPose).
-
-See `config/examples/train_lora_flux_identity_24gb.yaml` for a complete example config. Key settings:
-
-```yaml
-face_id:
-  identity_loss_weight: 0.1            # face preservation loss
-  body_proportion_loss_weight: 0.1     # body shape loss
-  face_suppression_weight: 0.5        # reduce diffusion loss on faces (optional)
+    class Encode frozen
+    class Model trainable
+    class Diff,Total loss
+    class Decode,RGBp,Pp,Pg,Anchor anchor
+    class LegendNote legendNode
+    style Perceptual fill:#faf5fc,stroke:#6a1b9a,stroke-dasharray:5 4,color:#4a148c
 ```
 
-Per-dataset overrides let you use stronger identity loss on portrait crops and add body proportion loss on full-body shots:
+The anchor path (purple) is what this extension adds. Both the GT image and the LoRA's prediction go through the **same frozen perceptor**, and the loss is computed on its outputs (a depth map for DA2, a face embedding for ArcFace, a keypoint heatmap for ViTPose). Gradients flow back through the perceptor and VAE decoder, translating the perceptual loss into a **latent-space update** for the LoRA. The weights most strongly nudged are the ones whose latents most affected the property the perceptor measures (depth, identity, pose); others barely move. Loss splitting (described below) takes this further by running the diffusion-loss step and the anchor-loss step alternately rather than summing them every step.
+
+### Depth-Consistency Anchor
+
+Tells the LoRA to keep the geometric structure of the training images while ignoring everything else. It separates "what's in the scene" (which is the LoRA's job) from "how it looks in this particular photo" (which can be left to the model's prior). Useful for:
+
+- **Subject LoRAs that generalize.** The model learns the subject's shape and pose without baking in the outfit, lighting, or backdrop of each training photo.
+- **Style transfer** that keeps scene composition but changes appearance.
+- **Reducing texture burn-in and stippling** on small datasets. Depth doesn't reinforce per-pixel artifacts, so fine-detail memorization slows down a lot.
+
+Powered by Depth-Anything-V2 (Small by default; Base or Large can be selected for stronger geometry).
+
+**Quick start:**
+
+```yaml
+depth_consistency:
+  loss_weight: 0.1                       # default; 0 disables
+  model_id: depth-anything/Depth-Anything-V2-Small-hf
+  mask_source: subject                   # 'none' | 'subject' | 'body'
+  loss_min_t: 0.0
+  loss_max_t: 1.0
+  preview_every: 100
+```
+
+The default of `0.1` is calibrated for **DA2-Small** (the default perceptor). If you switch to **DA2-Large**, drop the weight to around `0.001`, since the larger model produces much higher-magnitude gradients and `0.1` will overpower the diffusion loss. **DA2-Base** sits between the two; start at `0.01` and tune from there. If outputs look washed-out, over-smoothed, or the LoRA seems to be ignoring color and texture, the depth weight is too high. Halve it and retry.
+
+**Per-dataset overrides** (handy when different folders need different strengths):
 
 ```yaml
 datasets:
-  - folder_path: "/path/to/portraits"
-    identity_loss_weight: 0.1          # stronger for close-ups
-  - folder_path: "/path/to/fullbody"
-    identity_loss_weight: 0.05
-    body_proportion_loss_weight: 0.15  # preserve body shape
-    face_suppression_weight: 1.0       # full suppression — don't learn faces
+  - folder_path: /path/to/portraits
+    depth_loss_weight: 0.2               # stronger structure on portraits
+    depth_loss_min_t: 0.5                # only fire on noisy timesteps for this set
 ```
+
+Ground-truth depth maps are cached automatically at job start, so the anchor adds no per-step preprocessing cost once training begins.
+
+**Loss splitting (strongly recommended for most cases).** When the diffusion loss and depth anchor pull in different directions, having them fire on alternating optimizer steps instead of competing every step turns out to work better than running them together for almost every workflow we've tested. Set it on the dataset:
+
+```yaml
+datasets:
+  - folder_path: /path/to/data
+    loss_split: diffusion_depth
+```
+
+This separates structure-learning (depth) from appearance-learning (diffusion) into distinct optimizer steps. In practice it acts as a strong implicit regularizer against burn-in: fine-texture parameters update much more slowly than coarse-structure parameters, since the two losses only really agree on the latter. Try it before tuning weights or other knobs.
+
+### Identity Anchor (ArcFace)
+Keeps the trained subject's face recognizable across poses, expressions, and lighting. Useful when you're training on diverse appearances of the same person and the diffusion loss alone isn't enough to lock in identity. Recommended weight: **0.01 to 0.1**.
+
+### Body Proportion Anchor (ViTPose)
+Keeps body proportions (limb lengths, torso ratio) consistent with the training images. Useful for full-body subject LoRAs where the body shape should stay recognizable across generated poses. Recommended weight: **0.1 to 0.2**.
+
+### Face Suppression
+The inverse of the identity anchor: it tells the LoRA to *ignore* faces. The diffusion loss is downweighted (or zeroed) inside detected face regions, so the model doesn't learn to reproduce the faces in your dataset. Use this when training a style or clothing LoRA on a dataset that happens to contain people, and you want the style or outfit but not the faces.
+
+Set `face_id.face_suppression_weight` between `0` (off) and `1` (full suppression). Per-dataset overrides are supported.
+
+### Quick-start config
+
+```yaml
+depth_consistency:
+  loss_weight: 0.1                       # primary anchor (DA2-Small default; use 0.001 for DA2-Large)
+face_id:
+  identity_loss_weight: 0.1              # secondary
+  body_proportion_loss_weight: 0.1       # secondary
+  face_suppression_weight: 0.5           # optional
+  identity_metrics: true                 # log id_sim without applying loss
+```
+
+Per-dataset overrides let you tune each anchor for the dataset's content:
+
+```yaml
+datasets:
+  - folder_path: /path/to/portraits
+    depth_loss_weight: 0.2               # stronger structure on portraits
+    identity_loss_weight: 0.1            # stronger face on close-ups
+  - folder_path: /path/to/fullbody
+    body_proportion_loss_weight: 0.15    # preserve body shape
+    face_suppression_weight: 1.0         # full suppression, don't learn faces
+```
+
+See `config/examples/train_lora_flux_identity_24gb.yaml` for a complete example.
+
+## Auto-Masking
+
+Splits each training image into regions (body, clothing, and subject = body ∪ clothing) so different parts of the image can be weighted differently in the loss. Useful for:
+
+- **Subject LoRAs** that should focus on the person, not the background. Set the background weight low and the body weight high.
+- **Clothing LoRAs** that should learn outfit details while ignoring face and body.
+- **Letting the depth anchor focus on the subject** instead of computing depth-consistency over the whole image, where most of the frame is usually background you don't care about.
+
+Masks are generated per image at job start and cached.
+
+```yaml
+subject_mask:
+  enabled: true
+  body_close_radius: 5
+```
+
+```yaml
+datasets:
+  - folder_path: /path/to/data
+    background_loss_weight: 0.3
+    clothing_loss_weight: 0.7
+    body_loss_weight: 1.0
+    perceptual_restrict_to_body: true    # restrict perceptual anchors to body region
+```
+
+The depth anchor picks which mask it uses via `depth_consistency.mask_source` (`subject`, `body`, or `none`).
+
+QC tiles for visual inspection are saved at job start and can be regenerated from the dataset-tools UI.
+
+## Reg Dataset Semantics
+
+Reg datasets (`is_reg: true`) work the classic Dreambooth way: they're prior-preservation samples that train the model on generic non-subject images alongside your subject samples, so it doesn't forget how to make non-subject content while it's learning the subject. In this extension, reg semantics are tightened up:
+
+- **All perceptual anchors are turned off on reg samples.** Only the diffusion loss fires, scaled by `train.reg_weight`.
+- **Subject conditioning is stripped.** No clip-image or trigger-word injection.
+
+The effect is that reg samples teach the model "produce sharp prior-distribution images" without contaminating any of the subject-specific anchors. The 50/50 reg/train alternation runs at the optimizer-step level, so the gradient stays clean under any accumulation setting. `train.reg_weight` (default `1.0`) controls how strongly reg pulls vs. train.
+
+## Training Metrics
+
+Every active loss is logged so you can see during a run whether each anchor is doing its job. The training UI shows live charts plus per-sample tooltips on each point (which images drove the loss this step).
+
+| Metric | What it tells you |
+|---|---|
+| `diffusion_loss` | How well the model is matching training images per-pixel. Watch for it bottoming out, which usually means memorization. |
+| `diffusion_loss_tNN` | Diffusion loss broken down by timestep band (`t00` through `t90`). Useful for spotting whether low-noise or high-noise timesteps are dominating. |
+| `depth_consistency_loss` | How well the predicted geometry matches the training images. Should fall steadily; if it goes flat, the depth anchor isn't converging. |
+| `depth_loss_tNN` | Depth loss per timestep band. |
+| `id_sim` | Face cosine similarity (higher is better). Set `face_id.identity_metrics: true` to log this without applying the loss. |
+| `id_sim_tNN` | Per-timestep face similarity. |
+| `body_proportion_loss` | Pose-proportion error. |
+| `grad_norm` | Total gradient magnitude post-clip. Spikes usually mean a loss explosion. |
+| `grad_norm_diffusion`, `grad_norm_depth`, `grad_cos_diff_depth` | Optional gradient-cosine diagnostic. See below. |
+
+**Gradient-cosine diagnostic.** When you suspect two anchors are pulling in opposite directions, this measures how aligned their gradients are. Cosine near +1 means they reinforce each other, near 0 means they're independent, negative means they're fighting. Off by default; enable with `train.gradient_cosine_log_every: 50`.
+
+## Training Previews
+
+Visual previews are saved during training so you can see at a glance what each anchor is responding to.
+
+| Directory | What you see |
+|---|---|
+| `depth_previews/` | Side-by-side comparison of GT image, GT depth, predicted image, and predicted depth. Annotated with timestep and depth-loss value so you can scroll through training and watch the geometry converge. |
+| `id_previews/` | What the identity anchor is seeing: the face crop being scored, alongside the noisy input and the model's x0 prediction, with the cosine similarity overlaid. |
+| `body_previews/` | Skeleton overlays for reference vs. predicted poses. |
+| `subject_mask_previews/` | Mask QC: each image with its body, clothing, and subject masks overlaid, generated once at job start. |
+
+## Dataset-Tools UI
+
+Before training, the web UI provides preflight passes that prepare the cached data each anchor needs:
+
+- **Depth preflight.** Runs depth estimation across the dataset and shows visual QC tiles so you can spot bad masks or odd crops before they cost you a training run.
+- **Subject-mask preflight.** Generates and caches the body, clothing, and subject masks with overlays for review.
+- **Face-detection preflight.** Caches face bounding boxes and identity embeddings.
+
+All three run as non-blocking background jobs. Start them and come back when they're done.
+
+The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sampling N random images (with their captions) from a larger source. Useful for building reg sets, running ablations, or making smoke-test datasets without copying everything.
+
+## Example: Sketchwave Style (single-image style LoRA)
+
+Training a style LoRA from a single image. One training image, one caption, and the LoRA picks up an entire visual vocabulary.
+
+Sketchwave is a specific look: sketchy graphite-style linework over warm cream paper, with restricted earthy palettes (olive-green, ochre, wine-red, sepia) and slightly painterly shading. There's one training image, a portrait. The goal is for the LoRA to apply the look to anything the base model can paint, including subjects with nothing in common with the portrait.
+
+Dataset layout:
+
+```
+examples/sketchwave/dataset/
+├── 1.webp     # single training image
+└── 1.txt      # caption
+```
+
+The caption opens with the trigger phrase `sketchwave style.` and then describes the image in detail: figure, clothing, lighting, and an explicit enumeration of the palette ("warm cream-yellow background, tan-and-ochre skin, dark sepia-brown linework, dark brown-black hair..."). Calling out the palette is deliberate. In LoRA training, anything you describe in the caption stays controllable at inference, while anything you leave out becomes part of what the trigger word bakes in. Naming the colors here teaches the LoRA that those are content choices in this particular image, not the essence of sketchwave style itself, so the trigger applies later with whatever palette you prompt for.
+
+The training image itself:
+
+| ![Reference](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/dataset_reference.webp) |
+|:---:|
+| The single training illustration. |
+
+Full config is at [`examples/sketchwave/config.yaml`](examples/sketchwave/config.yaml). Key bits:
+
+- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
+- 1200 steps, batch size 1, gradient accumulation 2.
+- Resolution 768.
+- 1 image, `num_repeats: 50`.
+- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
+- Loss splitting on the dataset (`loss_split: diffusion_depth`).
+
+The interesting part is how the trained LoRA generalizes. None of these outputs share a subject with the training image. The LoRA carries the linework, palette, and paper-like shading onto identities and scenes with nothing in common with the training portrait, including an animal and an outdoor landscape:
+
+| New portrait | Different woman | Sleeping fox | Lakeside scene |
+|:---:|:---:|:---:|:---:|
+| ![Portrait](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_portrait.png) | ![Lady](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_lady.png) | ![Fox](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_fox.png) | ![Landscape](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_landscape.png) |
+
+To reproduce:
+
+```bash
+python run.py examples/sketchwave/config.yaml
+```
+
+Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
+
+## Example: Yoshitaka Amano Style (small-dataset style LoRA)
+
+Training a style LoRA from a small dataset of 14 illustrations. With depth anchoring the LoRA learns enough of the artist's visual language to carry it onto subjects nowhere in the dataset.
+
+Yoshitaka Amano is the illustrator behind the original Final Fantasy character art and a long-running body of solo watercolor portrait work. Flux 2 Klein 9B doesn't reproduce his look from a prompt alone; it defaults to generic anime or oil-paint stylings.
+
+One illustration from the dataset is shown below to give a feel for what the LoRA is asked to learn: loose ink linework, watercolor washes, ornate costuming, hair drawn as long flowing tendrils.
+
+| ![Reference](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/dataset_reference.jpeg) |
+|:---:|
+| One of the 14 training illustrations. |
+
+Key bits (full config at `output/amano/config.yaml` after a run):
+
+- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
+- 4000 steps, batch size 1, gradient accumulation 2.
+- Resolution 768.
+- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
+- Loss splitting on the dataset (`loss_split: diffusion_depth`).
+
+You can watch the depth anchor converge across training. Ground-truth pair (RGB | depth) first, then predicted pairs from an early step and a late step at a comparable noise level. Early on the predicted depth has heavy halo artifacts and doesn't track the figure cleanly; by the end it's a much closer match.
+
+Ground truth (RGB | depth):
+
+![Ground truth](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_gt.jpg)
+
+Early prediction (step 383, t=0.82), `depth_consistency_loss: 17.17`:
+
+![Early prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_early.jpg)
+
+Late prediction (step 3941, t=0.81), `depth_consistency_loss: 6.67`:
+
+![Late prediction](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/preview_pred_late.jpg)
+
+None of these subjects appear in the training set. The LoRA carries Amano's linework, color treatment, and composition language onto subjects from very different IPs:
+
+| Cloud (FF7) | Snow White (Disney) | Ziggy Stardust (Bowie) |
+|:---:|:---:|:---:|
+| ![Cloud](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_cloud.png) | ![Snow White](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_snow.png) | ![Ziggy](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-amano-v1/output_ziggy.png) |
+
+With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images; every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
+
+## Example: Handsome Squidward (single-image LoRA)
+
+Training a subject LoRA from a single image. One illustration, one caption, and the LoRA learns a character the base model can't reliably reproduce.
+
+Handsome Squidward is a side character from a single SpongeBob SquarePants episode. Flux 2 Klein 9B doesn't reliably reproduce him out of the box; prompts default to regular Squidward or a confused human-squid hybrid. We trained a LoRA on a single official illustration to teach the model what he looks like, then tested whether the trained LoRA could generalize to angles and contexts that don't exist anywhere in the source material.
+
+Dataset layout:
+
+```
+examples/squidward/dataset/
+├── 1.webp     # single training image
+└── 1.txt      # caption
+```
+
+The caption: *"a cartoon illustration of handsome squidward. he is standing confidently with his arms flared and his tentacle-hands on his hips. he is wearing a tight yellow shirt with a brown belt and gold buckle. he has four legs, two on each side close together. his legs are spread apart. there is a logo at the bottom of the frame."*
+
+Full config is at [`examples/squidward/config.yaml`](examples/squidward/config.yaml). Key bits:
+
+- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
+- 1200 steps, batch size 1, gradient accumulation 2.
+- 1 image, `num_repeats: 50`.
+- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
+- Loss splitting on the dataset (`loss_split: diffusion_depth`).
+
+Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
+
+Early (step 21), `depth_consistency_loss: 26.6`:
+
+![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg)
+
+Late (step 1199), `depth_consistency_loss: 1.6`:
+
+![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg)
+
+The training image is a confident front-three-quarter pose. Generations from the trained LoRA hold the character identity in poses, framings, and contexts that don't exist in the source material:
+
+| | |
+|:---:|:---:|
+| ![Output 1](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_1.png) | ![Output 2](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_2.png) |
+
+The first output is a near-direct front view, and there is no front-view reference anywhere in the source material, let alone the dataset. Both outputs maintain the character's distinctive identity (chiseled face, squid morphology, the specific drawn-on aesthetic) while placing him in contexts the LoRA wasn't trained on.
+
+From a single image, per-pixel diffusion MSE alone would just memorize the training photo. The depth anchor adds a structural objective that gets reinforced on the same one image, so the LoRA picks up a 3D-ish understanding of the character's shape that lets it interpolate to unseen angles. Loss splitting keeps the diffusion and depth gradients from interfering with each other, which dramatically reduces the texture burn-in that's the typical failure mode of one-shot LoRAs.
+
+To reproduce:
+
+```bash
+python run.py examples/squidward/config.yaml
+```
+
+Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
+
+## Configuration Reference
+
+Every extension-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
+
+### `depth_consistency.*`
+
+The depth anchor.
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `loss_weight` | `0.1` | Master switch. `0` disables. `0.1` is calibrated for DA2-Small (the default perceptor). Drop to ~`0.001` if you switch to DA2-Large, since it produces much higher-magnitude gradients. If outputs look washed-out or over-smoothed, halve the weight and retry. |
+| `model_id` | `Depth-Anything-V2-Small-hf` | Which DA2 variant. Small is fast and adequate for most subjects. Base or Large give cleaner depth on cluttered scenes at higher VRAM cost. **Lower the loss weight when using a larger model** (Base ~`0.01`, Large ~`0.001`). |
+| `mask_source` | `subject` | Which mask the loss applies through. `subject` is recommended for subject LoRAs (loss restricted to the person). `body` excludes clothing. `none` uses the full image. |
+| `loss_min_t` | `0.0` | Lower edge of the timestep window where the depth anchor fires. |
+| `loss_max_t` | `1.0` | Upper edge of the timestep window. Narrow to mid-high (e.g. `0.5` to `0.9`) to focus the anchor on the identity-encoding noise band. |
+| `ssi_weight` | `1.0` | Scale-and-shift-invariant L1 term weight. Rarely needs tuning. |
+| `grad_weight` | `0.5` | Multi-scale gradient term weight. Increase for more sensitivity to fine geometric structure. |
+| `grad_scales` | `4` | Number of pyramid scales for the gradient term. Rarely needs tuning. |
+| `input_size` | `518` | DA2 input resolution. Must be a multiple of 14. Can go up to `1400` for the clearest depth maps, at proportionally higher VRAM and compute cost. The default `518` is a good balance for most setups; bump to `714` or `980` if you want sharper depth on detailed scenes, or `1400` for the maximum the perceptor will accept. |
+| `grad_checkpoint` | `true` | Gradient checkpointing through the perceptor for memory savings. Leave on unless you're on huge VRAM. |
+| `preview_every` | `100` | Save a depth preview tile every N steps to `depth_previews/`. Set to 0 to disable. |
+| `preview_min_t` | `0.0` | Only save previews at timesteps at or above this. |
+
+### `face_id.*`
+
+The identity-related anchor losses.
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `face_model` | `buffalo_l` | InsightFace model used for face detection and embeddings. Don't change unless you have a specific reason. |
+
+**Identity anchor** (the loss that keeps face recognizable):
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `identity_loss_weight` | `0.0` | Master switch. Typical 0.01 to 0.1. Higher locks in face shape harder, but too high constrains expressions. |
+| `identity_loss_min_t` | `0.0` | Timestep window lower edge. |
+| `identity_loss_max_t` | `1.0` | Timestep window upper edge. |
+| `identity_loss_min_cos` | `0.2` | Minimum face similarity for the loss to fire on a sample. Below this, the predicted x0 likely doesn't contain a recognizable face yet, so the loss is skipped to avoid hallucinating one. |
+| `identity_metrics` | `false` | Log `id_sim` without applying the loss. Useful for measuring identity drift in vanilla runs as a baseline. |
+| `identity_loss_use_average` | `true` | Compare against the dataset's average face embedding instead of per-image. More robust on diverse training sets. |
+| `identity_loss_average_blend` | `0.0` | Blend per-image with dataset average. 0 = per-image only, 0.5 = midpoint, 1.0 = pure average. |
+| `identity_loss_use_random` | `false` | Compare against a random embedding from the dataset each step. Useful for mixed-identity training. |
+| `identity_loss_num_refs` | `0` | If > 0, compare against K random embeddings and use best match. |
+
+**Body proportion anchor** (ViTPose bone-length ratios):
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `body_proportion_loss_weight` | `0.0` | Master switch. Typical 0.1 to 0.2. Use on full-body subject LoRAs where body shape should stay recognizable across poses. |
+| `body_proportion_loss_min_t` | `0.0` | Timestep window lower edge. |
+| `body_proportion_loss_max_t` | `1.0` | Timestep window upper edge. |
+| `body_proportion_include_head` | `false` | Include head-related ratios. Off by default since identity anchor handles the head better. |
+
+**Face suppression** (the inverse anchor; tells the LoRA to *not* learn faces):
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `face_suppression_weight` | `null` | Master switch. `null` = no suppression. `0.0` = zero face loss (don't learn faces at all). `0.5` = half. `1.0` = normal. Use `0.0` for style or clothing LoRAs trained on photos with people. |
+| `face_suppression_expand` | `2.0` | Multiplier on the face bounding box. `1.0` = tight face box, `1.8-2.0` = full head coverage. |
+| `face_suppression_soft` | `false` | Gaussian falloff at the box edges instead of a hard rectangle. Smoother but slightly more invasive. |
+
+### `subject_mask.*`
+
+Auto-masking pipeline.
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `enabled` | `false` | Master switch. Set true to extract per-image masks at job start. |
+| `body_close_radius` | `2` | Morphological closing on the body mask. Higher values fill gaps in limbs and hair (e.g. `5` for blurry photos) at the cost of boundary precision. Changing this invalidates cached masks. |
+| `mask_dilate_radius` | `0` | Outer dilation on the subject mask. Useful when you want a padding margin around the subject. |
+| `skin_bias` | `0.0` | Bias added to body-class logits where skin tone is detected. Set to 1-3 if your dataset has lots of exposed skin and SegFormer is mislabeling it as clothing. |
+| `save_debug_previews` | `false` | Save preview tiles per image. The dataset-tools UI preflight does the same thing on demand. |
+| `segformer_res` | `768` | SegFormer input resolution. Don't change unless you know what you're doing. |
+| `cache_resolution` | `256` | Cached mask resolution. Higher = sharper at training time, more disk. |
+| `yolo_ckpt`, `yolo_conf`, `sam_size`, `dtype`, `primary_only` | (defaults) | Detection / segmentation backend knobs. The defaults work for almost everyone. |
+
+### `train.*` (extension-specific additions)
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `reg_weight` | `1.0` | Multiplier on diffusion loss for reg samples. `1.0` (equal pull) is the sane default. Increase to 1.5-2.0 if reg isn't preserving the prior strongly enough. |
+| `gradient_cosine_log_every` | `0` | Diagnostic. Every N optimizer steps, measure `cos(g_diffusion, g_depth)` and log the per-loss gradient norms. `0` disables. Use 50-100 to diagnose anchor conflicts without much overhead. |
+| `min_denoising_steps` | `0` | Lower bound on the timestep sampler (0-999). The training loop only samples from `[min, max]`. Useful for focused training, e.g. `min=700, max=700` to train at one specific noise level. |
+| `max_denoising_steps` | `999` | Upper bound on the timestep sampler. |
+
+### Per-dataset overrides (`datasets[].*`)
+
+Every entry in `datasets:` accepts these extension-specific overrides. `null` or omitted = inherit the global value.
+
+| Option | What it does, when to use it |
+|---|---|
+| `is_reg` | Mark this dataset as a regularization set. Strips subject conditioning and turns off all perceptual anchors on its samples. |
+| `loss_split: diffusion_depth` | Strongly recommended for most cases. Alternates diffusion and depth-anchor on this dataset's samples per optimizer step (rather than running both every step). |
+| `depth_loss_weight` | Per-dataset override of the depth anchor's `loss_weight`. Set to `0` to fully disable the depth anchor for this dataset (skips perceptor compute on its samples). |
+| `depth_loss_min_t` / `depth_loss_max_t` | Per-dataset depth-anchor timestep window. |
+| `depth_model_id` | Per-dataset DA2 variant. Useful if one dataset has unusual geometry that benefits from Large while others stay on Small. |
+| `identity_loss_weight` / `_min_t` / `_max_t` / `_min_cos` | Per-dataset identity-anchor controls. Stronger weights on portrait crops, weaker on full-body. |
+| `body_proportion_loss_weight` / `_min_t` / `_max_t` | Per-dataset body-proportion controls. Useful for full-body shots where pose proportions matter. |
+| `face_suppression_weight` | Per-dataset face suppression. Per-dataset takes priority over global. |
+| `background_loss_weight` / `clothing_loss_weight` / `body_loss_weight` | Per-region diffusion weight scaling. Used when `subject_mask.enabled` is true. Set background low (e.g. 0.3) and body high (1.0) to tell the LoRA to focus on the subject. |
+| `perceptual_restrict_to_body` | Restrict perceptual-anchor losses to the body mask region for this dataset. |
 
 ---
 
 ## Upstream: AI Toolkit by Ostris
 
-This fork is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
+This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), an all-in-one training suite for diffusion models on consumer hardware.
 
 ### Support the Original Author
 
 [Sponsor on GitHub](https://github.com/orgs/ostris) | [Support on Patreon](https://www.patreon.com/ostris) | [Donate on PayPal](https://www.paypal.com/donate/?hosted_button_id=9GEFUKC8T9R9W)
 
-### Current Sponsors
-
-All of these people / organizations are the ones who selflessly make this project possible. Thank you!!
-
-_Last updated: 2026-03-03 15:01 UTC_
-
-<p align="center">
-<a href="https://x.com/NuxZoe" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1919488160125616128/QAZXTMEj_400x400.png" alt="a16z" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/replicate" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/60410876?v=4" alt="Replicate" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/huggingface" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/25720743?v=4" alt="Hugging Face" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-</p>
-<hr style="width:100%;border:none;height:2px;background:#ddd;margin:30px 0;">
-<p align="center">
-<a href="https://www.pixelcut.ai/" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1496882159658885133/11asz2Sc_400x400.jpg" alt="Pixelcut" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/weights-ai" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/185568492?v=4" alt="Weights" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/josephrocca" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/1167575?u=92d92921b4cb5c8c7e225663fed53c4b41897736&v=4" alt="josephrocca" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c8.patreon.com/4/200/93304/J" alt="Joseph Rocca" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/161471720/dd330b4036d44a5985ed5985c12a5def/eyJ3IjoyMDB9/1.jpeg?token-hash=k1f4Vv7TevzYa9tqlzAjsogYmkZs8nrXQohPCDGJGkc%3D" alt="Vladimir Sotnikov" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/33158543/C" alt="clement Delangue" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/8654302/b0f5ebedc62a47c4b56222693e1254e9/eyJ3IjoyMDB9/2.jpeg?token-hash=suI7_QjKUgWpdPuJPaIkElkTrXfItHlL8ZHLPT-w_d4%3D" alt="Misch Strotz" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://www.runcomfy.com/trainer/ai-toolkit/app" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1747828425736273922/nlPQTDYO_400x400.jpg" alt="RunComfy" width="200" height="200" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-</p>
-<hr style="width:100%;border:none;height:2px;background:#ddd;margin:30px 0;">
-<p align="center">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/120239481/49b1ce70d3d24704b8ec34de24ec8f55/eyJ3IjoyMDB9/1.jpeg?token-hash=o0y1JqSXqtGvVXnxb06HMXjQXs6OII9yMMx5WyyUqT4%3D" alt="nitish PNR" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/152118848/3b15a43d71714552b5ed1c9f84e66adf/eyJ3IjoyMDB9/1.png?token-hash=MKf3sWHz0MFPm_OAFjdsNvxoBfN5B5l54mn1ORdlRy8%3D" alt="Kristjan Retter" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/2298192/1228b69bd7d7481baf3103315183250d/eyJ3IjoyMDB9/1.jpg?token-hash=opN1e4r4Nnvqbtr8R9HI8eyf9m5F50CiHDOdHzb4UcA%3D" alt="Mohamed Oumoumad" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/548524/S" alt="Steve Hanff" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/169502989/220069e79ce745b29237e94c22a729df/eyJ3IjoyMDB9/1.png?token-hash=E8E2JOqx66k2zMtYUw8Gy57dw-gVqA6OPpdCmWFFSFw%3D" alt="Timothy Bielec" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/9547341/bb35d9a222fd460e862e960ba3eacbaf/eyJ3IjoyMDB9/1.jpeg?token-hash=Q2XGDvkCbiONeWNxBCTeTMOcuwTjOaJ8Z-CAf5xq3Hs%3D" alt="Travis Harrington" width="150" height="150" style="border-radius:8px;margin:5px;display: inline-block;">
-</p>
-<hr style="width:100%;border:none;height:2px;background:#ddd;margin:30px 0;">
-<p align="center">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/5021048/c6beacab0fdb4568bf9f0d549aa4bc44/eyJ3IjoyMDB9/1.jpeg?token-hash=JTEtFVzUeU7pQw4R3eSn6rGgqgi44uc2rDBAv6F6A4o%3D" alt="Infinite " width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/33228112/J" alt="Jimmy Simmons" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/55206617/X" alt="xv" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/E2GO" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/1776669?u=bf52b2691fa7d1e421d6167b804a2c1cf3b229e7&v=4" alt="E2GO" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/80767260/1fa7b3119f9f4f40a68452e57de59bfe/eyJ3IjoyMDB9/1.jpeg?token-hash=H34Vxnd58NtbuJU1XFYPkQnraVXSynZHSL3SMMcdKbI%3D" alt="nuliajuk" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/27288932/6c35d2d961ee4e14a7a368c990791315/eyJ3IjoyMDB9/1.jpeg?token-hash=TGIto_PGEG2NEKNyqwzEnRStOkhrjb3QlMhHA3raKJY%3D" alt="David Garrido" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/40761075/R" alt="Randy McEntee" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://x.com/NuxZoe" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1916482710069014528/RDLnPRSg_400x400.jpg" alt="tungsten" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c8.patreon.com/4/200/358350/L" alt="L D" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/squewel" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/97603184?v=4" alt="squewel" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://clwill.com/" target="_blank" rel="noopener noreferrer"><img src="https://images.squarespace-cdn.com/content/v1/63d444727a5d5f304f89eebe/c9def9ce-3824-404d-a8bb-96b6236338ca/favicon.ico?format=100w" alt="Christopher Williams" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="http://www.ir-ltd.net" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1602579392198283264/6Tm2GYus_400x400.jpg" alt="IR-Entertainment Ltd" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/128354277/52c073d323924b02ada90c9eacc6b0a0/eyJ3IjoyMDB9/1.png?token-hash=Oc0mVzELN1s1r0lLQTEO_sfJ2lEMC3X-By2O2bG6h_Q%3D" alt="Alastair Green" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/7208949/D" alt="D G" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/3712451/432e22a355494ec0a1ea1927ff8d452e/eyJ3IjoyMDB9/7.jpeg?token-hash=OpQ9SAfVQ4Un9dSYlGTHuApZo5GlJ797Mo0DtVtMOSc%3D" alt="David Shorey" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/179944/P" alt="Paul Kroll" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/98811435/3a3632d1795b4c2b9f8f0270f2f6a650/eyJ3IjoyMDB9/1.jpeg?token-hash=657rzuJ0bZavMRZW3XZ-xQGqm3Vk6FkMZgFJVMCOPdk%3D" alt="EmmanuelMr18" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/Slartibart23" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/133593860?u=31217adb2522fb295805824ffa7e14e8f0fca6fa&v=4" alt="Slarti" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c8.patreon.com/4/200/27791680/J" alt="Jean-Tristan Marin" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/93348210/5c650f32a0bc481d80900d2674528777/eyJ3IjoyMDB9/1.jpeg?token-hash=0jiknRw3jXqYWW6En8bNfuHgVDj4LI_rL7lSS4-_xlo%3D" alt="Armin Behjati" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/155963250/6f8fd7075c3b4247bfeb054ba49172d6/eyJ3IjoyMDB9/1.png?token-hash=z81EHmdU2cqSrwa9vJmZTV3h0LG-z9Qakhxq34FrYT4%3D" alt="Un Defined" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/50279373/326f5dc32cc749d7afb8df64f202ad00/eyJ3IjoyMDB9/1.jpeg?token-hash=PUJrhne0p1Z-DIKb6_NV7ZI7su5EknTeejjBCffg0IQ%3D" alt="Jürgen Stein" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/49347178/8cd9db18638c4b9d8ec90ccf729d6704/eyJ3IjoyMDB9/1.jpeg?token-hash=zw9cDUwUupmEAMLeQ8AScBOt8p2mkdbQGXU6PS4j4zk%3D" alt="Khoi Nguyen" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/570742/4ceb33453a5a4745b430a216aba9280f/eyJ3IjoyMDB9/1.jpg?token-hash=nPcJ2zj3sloND9jvbnbYnob2vMXRnXdRuujthqDLWlU%3D" alt="Al H" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/82763/f99cc484361d4b9d94fe4f0814ada303/eyJ3IjoyMDB9/1.jpeg?token-hash=A3JWlBNL0b24FFWb-FCRDAyhs-OAxg-zrhfBXP_axuU%3D" alt="Doron Adler" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/103077711/bb215761cc004e80bd9cec7d4bcd636d/eyJ3IjoyMDB9/2.jpeg?token-hash=3U8kdZSUpnmeYIDVK4zK9TTXFpnAud_zOwBRXx18018%3D" alt="John Dopamine" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/99036356/7ae9c4d80e604e739b68cca12ee2ed01/eyJ3IjoyMDB9/3.png?token-hash=ZhsBMoTOZjJ-Y6h5NOmU5MT-vDb2fjK46JDlpEehkVQ%3D" alt="njgnfhahfnhnwir" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/141098579/1a9f0a1249d447a7a0df718a57343912/eyJ3IjoyMDB9/2.png?token-hash=_n-AQmPgY0FP9zCGTIEsr5ka4Y7YuaMkt3qL26ZqGg8%3D" alt="The Local Lab" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/30931983/54ab4e4ceab946e79a6418d205f9ed51/eyJ3IjoyMDB9/1.png?token-hash=j2phDrgd6IWuqKqNIDbq9fR2B3fMF-GUCQSdETS1w5Y%3D" alt="HestoySeghuro ." width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/4105384/J" alt="Jack Blakely" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/53077895/M" alt="Marc" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/46680573/ee3d99c04a674dd5a8e1ecfb926db6a2/eyJ3IjoyMDB9/1.jpeg?token-hash=cgD4EXyfZMPnXIrcqWQ5jGqzRUfqjPafb9yWfZUPB4Q%3D" alt="Neil Murray" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/44568304/a9d83a0e786b41b4bdada150f7c9271c/eyJ3IjoyMDB9/1.jpeg?token-hash=FtxnwrSrknQUQKvDRv2rqPceX2EF23eLq4pNQYM_fmw%3D" alt="Albert Bukoski" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/5048649/B" alt="Ben Ward" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/134129880/680c7e14cd1a4d1a9face921fb010f88/eyJ3IjoyMDB9/1.png?token-hash=5fqqHE6DCTbt7gDQL7VRcWkV71jF7FvWcLhpYl5aMXA%3D" alt="Bharat Prabhakar" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/494309/J" alt="Julian Tsependa" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/159203973/36c817f941ac4fa18103a4b8c0cb9cae/eyJ3IjoyMDB9/1.png?token-hash=zkt72HW3EoiIEAn3LSk9gJPBsXfuTVcc4rRBS3CeR8w%3D" alt="Marko jak" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/76566911/6485eaf5ec6249a7b524ee0b979372f0/eyJ3IjoyMDB9/1.jpeg?token-hash=mwCSkTelDBaengG32NkN0lVl5mRjB-cwo6-a47wnOsU%3D" alt="the biitz" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/83034/W" alt="william tatum" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/julien-blanchon" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/11278197?v=4" alt="Blanchon" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/111904990/08b1cf65be6a4de091c9b73b693b3468/eyJ3IjoyMDB9/1.png?token-hash=_Odz6RD3CxtubEHbUxYujcjw6zAajbo3w8TRz249VBA%3D" alt="Brian Smith" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/5602036/c7b6e02bab1241fc83ff5a0cedf19b43/eyJ3IjoyMDB9/1.jpeg?token-hash=nnd10QRNxqaHmhwr-zQh4EIlBDIFJEvt65YB3ebjhNw%3D" alt="Kelevra Quackenstien" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/11198131/e696d9647feb4318bcf16243c2425805/eyJ3IjoyMDB9/1.jpeg?token-hash=c2c2p1SaiX86iXAigvGRvzm4jDHvIFCg298A49nIfUM%3D" alt="Nicholas Agranoff" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/785333/bdb9ede5765d42e5a2021a86eebf0d8f/eyJ3IjoyMDB9/2.jpg?token-hash=l_rajMhxTm6wFFPn7YdoKBxeUqhdRXKdy6_8SGCuNsE%3D" alt="Sapjes " width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Frank Vance" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://x.com/RalFingerLP" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/919595465041162241/ZU7X3T5k_400x400.jpg" alt="RalFinger" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/Spikhalskiy" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/532108?u=2464983638afea8caf4cd9f0e4a7bc3e6a63bb0a&v=4" alt="Dmitry Spikhalsky" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/dylanzonix" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/167351340?v=4" alt="Dylan" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c8.patreon.com/4/200/88567307/E" alt="el Chavo" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Gary Joseph" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/jakeblakeley" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/2407659?u=be0bc786663527f2346b2e99ff608796bce19b26&v=4" alt="Jake Blakeley" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/117569999/55f75c57f95343e58402529cec852b26/eyJ3IjoyMDB9/1.jpeg?token-hash=squblHZH4-eMs3gI46Uqu1oTOK9sQ-0gcsFdZcB9xQg%3D" alt="James Thompson" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://pbs.twimg.com/profile_images/445246812723503104/mX9BVPMv_400x400.png" alt="q5sys" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Sylvain Fayette" width="100" height="100" style="border-radius:8px;margin:5px;display: inline-block;">
-</p>
-<hr style="width:100%;border:none;height:2px;background:#ddd;margin:30px 0;">
-<p align="center">
-<img src="https://c8.patreon.com/4/200/63510241/A" alt="Andrew Park" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/28533016/e8f6044ccfa7483f87eeaa01c894a773/eyJ3IjoyMDB9/2.png?token-hash=ak-h3JWB50hyenCavcs32AAPw6nNhmH2nBFKpdk5hvM%3D" alt="William Tatum" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/91298241/1b1e6d698cde4faaaae6fc4c2d95d257/eyJ3IjoyMDB9/1.jpeg?token-hash=GCo7gAF_UUdJqz3FsCq8p1pq3AEoRAoC6YIvy5xEeZk%3D" alt="Daniel Partzsch" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/59408413/a0530a7770b6444bafdf0bc9f589eff0/eyJ3IjoyMDB9/1.jpg?token-hash=BlbxZsQpgchtqjByDuW9T8NoFWmCor5sWI0umhUKNlA%3D" alt="ByteC" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/Wallawalla47" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/46779408?v=4" alt="Ian R" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c8.patreon.com/4/200/11180426/J" alt="jarrett towe" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/63232055/2300b4ab370341b5b476902c9b8218ee/eyJ3IjoyMDB9/1.png?token-hash=R9Nb4O0aLBRwxT1cGHUMThlvf6A2MD5SO88lpZBdH7M%3D" alt="Marek P" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/84873332/H" alt="Htango2" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/55160464/42d4719ba0834e5d83aa989c04e762da/eyJ3IjoyMDB9/1.jpeg?token-hash=_twZUkW3NREIxGUOWskUdvuZQGEcRv9XMfu5NrnCe5M%3D" alt="Chris Canterbury" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/63920575/D" alt="Dutchman5oh" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/27580949/97c7dd2456a34c71b6429612a9e20462/eyJ3IjoyMDB9/1.jpeg?token-hash=cASxwWk8joAXx4tUAHch5CvTiYBR2UOHMeJK6se5fl0%3D" alt="Gergely Madácsi" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/33866796/7fd2a214fd5c4062b0dd63a29f8de5bd/eyJ3IjoyMDB9/1.png?token-hash=8s-7yi8GawIlqr0FCTk5JWKy26acMiYlOD8LAk2HqqU%3D" alt="James" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/84891403/83682a2a2d3b49ba9d28e7221edd5752/eyJ3IjoyMDB9/1.jpeg?token-hash=LVB6lta4BonhfPwSUnZIDmSW3IU-eEO4sXD7NSK367g%3D" alt="Koray Birand" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/mertguvencli" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/29762151?u=bffbb3564ff18f22d8876c3109bb9f96e6d9d9a8&v=4" alt="Mert Guvencli" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/902918/5344727418634dc7b7fe7709d515a1d9/eyJ3IjoyMDB9/2.jpg?token-hash=myqV_oclkicVk9BDrvTO50jyjxJJGZ8i7oVJHwc05to%3D" alt="Michael Carychao" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/27667925/6dac043a087e4c498e842dfad193baae/eyJ3IjoyMDB9/1.jpeg?token-hash=0bSVQo7QMMdGxFazeM099gsR0wtf28_ZTXeLIHEbIVk%3D" alt="S.Hasan Rizvi" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/31613309/434500d03f714dc18049306ed3f0165c/eyJ3IjoyMDB9/1.jpg?token-hash=acILbq09wxUfJe-G2nMYUYkvHJ88ZxkzU4JebRPw2P0%3D" alt="Theta Graphics" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/10876902/T" alt="Tyssel" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/89623281/28d0cb75fc68439d9491f4343966f56e/eyJ3IjoyMDB9/1.jpeg?token-hash=Zt5UxtzvxDJGTPVh5Yr5rTY8JrcDsni0Mi89nZuYrp4%3D" alt="michele carlone" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/48109692/4237f732212343448ee87f5badc26e2c/eyJ3IjoyMDB9/1.jpeg?token-hash=gGqrOyctiITIyPZgjmF6YQKNf6cS9OeY4waIav3OAiU%3D" alt="Yves Poezevara" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Gage Siuniak" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/145890236/693fa0afb9204bbdb011a4570f5f3065/eyJ3IjoyMDB9/1.jpeg?token-hash=uahzo4u8WosIjwsPLn-rGlDySZMLfeCN3QvcHv4mgRY%3D" alt="Chip Johansen" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/5155933/C" alt="Chris Dermody" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/6225312/F" alt="Fredrik Normann Johansen" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/44200812/f84fd628abb243bbaded4203761aca29/eyJ3IjoyMDB9/1.png?token-hash=ArthznCCT4BqOSMj_9oP4ECWWHnrb8nYPUDZ6DqSvMU%3D" alt="kingroka" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/5233761/N" alt="Newtown " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/7979776/P" alt="PizzaOrNot " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/82707622/3f0de2ffd6eb4074ba91e81381146e1c/eyJ3IjoyMDB9/1.jpeg?token-hash=wk6wjILO2dDHJla7gn3MH9mEKl08e7PuBDwZRUtEQAw%3D" alt="Russell Norris" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/2986571/S" alt="stev " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/zappazack" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/74406132?u=356e66c964f9ca4859b274ff6788aebd16e218d4&v=4" alt="zappazack" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://www.youtube.com/@happyme7055" target="_blank" rel="noopener noreferrer"><img src="https://yt3.googleusercontent.com/ytc/AIdro_mFqhIRk99SoEWY2gvSvVp6u1SkCGMkRqYQ1OlBBeoOVp8=s160-c-k-c0x00ffffff-no-rj" alt="Marcus Rass" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Rainer Kulow" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Stavros Glezakos" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Stavros Glezakos" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/2888571/65c717bd8a564e469c25aa5858f9821b/eyJ3IjoyMDB9/1.png?token-hash=zwMOgNEoC9hlr2KamiB7TG004gCfJ2exSRDO4dhxo5Q%3D" alt="Derrick Schultz" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/14767188/1f22bccbf86b45a2b32642c3f5a493b3/eyJ3IjoyMDB9/1.png?token-hash=cJhOEsMXSv_d5fcqCu8Q_idyYtqc4UocsOaTflsSmT8%3D" alt="Kukee" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/138787313/c809120005024afa959231fe8b253fd9/eyJ3IjoyMDB9/1.png?token-hash=O6x0kkR4uKBsg_OODFHjZqwAupVztiZEOiXYF_7yKxM%3D" alt="Metryman55" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/604598/5b0c3030a62d4606848f9ebc1f4318f2/eyJ3IjoyMDB9/1.jpeg?token-hash=EnSp4F3aafnQ9SONb1YrSIQRlQPk29h4TWcRzPUv6-c%3D" alt="Tri3Ax " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/5752417/G" alt="Guillaume Roy" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/154134231/5d307160968b4c29922e2729bb555c99/eyJ3IjoyMDB9/1.jpeg?token-hash=dNP94e42G_A9CHO5zYfUunS2K80y3BPDHQ3NdzphNRY%3D" alt="Colin Boyd" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/122373805/d0d995f2a7d6483cbbe0e9b14391d1ed/eyJ3IjoyMDB9/1.png?token-hash=oQCZooskREZOB36TW0KNZASDeLc88yswNzF-PqcVQyw%3D" alt="DavidO" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/45804549/8117b86a8c4145348ed392d3ea8c9dde/eyJ3IjoyMDB9/2.png?token-hash=ej_ln6ecs0-Cija3vrXaWYFFyWEK2TWmItJE5ALWP4s%3D" alt="Jadev1311" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/194433979/a18cf671feef435c9a93080f11cc8cf3/eyJ3IjoyMDB9/1.png?token-hash=TN6zMy2-V1Wg5uSpZHstYAZAdb_DYk9Erk3XDjE8--M%3D" alt="Cyril Diagne" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Christopher Frey" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="keonmin lee" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/94453070/S" alt="Speedy2023" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="yvggeniy romanskiy" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/136770679/bfc06edc256e4e8c9d5e69669400ce80/eyJ3IjoyMDB9/1.png?token-hash=syeNGY9CgVD1D6v_EPNGafyTrzeXH_JMF3EAFyFJhvw%3D" alt="Ben May | sofsy" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/17697321/C" alt="Chris Day" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/58082790/5f425b9f949047f78d9ae98e86faad35/eyJ3IjoyMDB9/1.png?token-hash=WYfg_M7cLsY-crrv71jcy6LLV77bB0_uD2_aw2f9nJ0%3D" alt="Greg Lemons" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/7436837/K" alt="Ken Finlayson" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/75353/cff7a01bb97a45bba9023f1ff4a5f07a/eyJ3IjoyMDB9/1.jpeg?token-hash=3TxvQTWQSYWeqK4Elb6lX9y5ts21jh5jsWa1cXykcG8%3D" alt="Kenneth Loebenberg" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/31096978/f36222d290d2438cba8cfa3de63453c9/eyJ3IjoyMDB9/1.JPG?token-hash=0gwLI-GVquqxBj3FRR4XqJuRonvT5FsN5rdND2jApL0%3D" alt="Le_Fourbe " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/93681621/d638ff4a9e0a40a7bc2c24bae4d6f353/eyJ3IjoyMDB9/1.png?token-hash=AxFFly1YYJskPzdkaU_M5jgyb0kZijSxB1Yb2AbE9h0%3D" alt="Manuel2Santos" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/97609519/M" alt="Mollie" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/4544036/O" alt="Osman Bayazit" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/106121692/060eb9f09ecc4dceb7fa0a6d3c330b85/eyJ3IjoyMDB9/1.jpeg?token-hash=K6vA5Foyh9tAy3yzCtuYKDRF9McrCbQaEUC61x2x1Ic%3D" alt="Pablo Fonseca" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/188726649/6db3706d63f14468a58535ae5fd1344c/eyJ3IjoyMDB9/1.png?token-hash=QzCqu543VaxIuxyXo_1qrYqBQAyOhprcfNfNSIN3TYk%3D" alt="Phil Ring" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/rickrender" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/121735855?u=a8187fe40cec7f3afdd7c4bb128e0cca500fc220&v=4" alt="renderartist" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/25199293/e967e5c4ed884f07b705271e253fd584/eyJ3IjoyMDB9/1.png?token-hash=uupXPicJ3Glks9mm5WDriIb1PBUbRmoVgSR6vcMPjlY%3D" alt="Rob Stevens" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/2622685/bddc4b42c82c47d8b30b05c000b8127b/eyJ3IjoyMDB9/1.jpg?token-hash=4tEFL9DP2L5dpg7rxUcFBlw27qnHO2ceyG38RtI9_Hg%3D" alt="Saftle " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/7408850/e90af02547724fc59ca1f21565df93b1/eyJ3IjoyMDB9/1.png?token-hash=RnqIUjFVhT7ZpV79q8cgTxCULkVfyQxpWNy4yIQIhlk%3D" alt="Virtamouse" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/107652364/5cae258ff5cd4c9a8e104861e63d5180/eyJ3IjoyMDB9/1.png?token-hash=qkRK53prBXDFG4b_Opnb80wcvWj6q0FjgNqPoSz24yU%3D" alt="Yi Chen" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Joakim Sällström" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/2697420/C" alt="Craig Penn" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/76956764/68082831372d4b58b21c87c2d6f81e93/eyJ3IjoyMDB9/1.jpeg?token-hash=_jMdHYevH1sM7a0hPsqpkkupuIGaDvAmkr8stWmpsUw%3D" alt="Andrey Sorokin" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/62933094/d69149b4cb9043e99614d2151c4d1288/eyJ3IjoyMDB9/1.jpg?token-hash=oJSs1KuWe9zorODOtGKn6ceSDjsmOZ4hrohVQ2Y45nQ%3D" alt="Blane" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/15407925/B" alt="Brian M" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/caleboleary" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/12816579?u=d7f6ec4b7caf3c4535385a5fa3d7c155057ef664&v=4" alt="Caleb O'Leary" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/73708729/52866102958248c19e646b6b62c7c51a/eyJ3IjoyMDB9/1.png?token-hash=S_haqcc-5zBK1tefXbphLzvA-MGtmstPNlaHch3k4zo%3D" alt="Cora Nox" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/12844508/fd08528fbed74a359acb1f8d06181c0c/eyJ3IjoyMDB9/1.jpeg?token-hash=TNDGh5TSWmlteKxsvB6FLE9wwawPMyvNBaim2U2KRC4%3D" alt="Dave Talbott" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/129159473/d6547bf609f24fc486b8a72de925acad/eyJ3IjoyMDB9/1.png?token-hash=SajmmmA4r5PcVkkocZb78TA1MD0HzwHApTy4CJmwOCc%3D" alt="Dustin Lausch" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/195837329/a136ba74b4d94df3a2b37e944beb6b9d/eyJ3IjoyMDB9/1.png?token-hash=oAIpcAmkts3GjjTjJVg2QrYs4UdcXgbW8q11p4kjVqQ%3D" alt="Greg Richards" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/16145383/eaf99f01440d4d1a831584f2d3ab1a2c/eyJ3IjoyMDB9/2.jpg?token-hash=BhictNJpGdyywzEepZrGlEY2anNZZjLDQoo2drXM13o%3D" alt="Gribbly" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/12128150/J" alt="Joshua Genke" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/45125613/8a45d1081bfc43b0bf4cb523558cab65/eyJ3IjoyMDB9/3.jpeg?token-hash=iUZhvndnfAiT97FacklmB4XvnMxj0pvepaHsU7JBxLg%3D" alt="Tiny Tsuruta" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/134029856/d1c895bf165149f69ad81ac426e617e9/eyJ3IjoyMDB9/1.jpeg?token-hash=FPzyMI3pAjnZmRlH_nmy2baIRcGKtQrDnN6aMCOHVwo%3D" alt="v33ts" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/lirexxx" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/94787562?u=ed7e681cbc200269a081c4151d6adfa6ef728f85&v=4" alt="Dimitar A." width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Heikki Rinkinen" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Josh Lindo" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Phan Dao" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="StrictLine e.U." width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="The Rope Dude" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Till Meyer" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Valarm, LLC" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Valarm, LLC" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Xavier Climent" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/15703526/L" alt="Leo " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/29010107/37b05d32281f460baa28b4a2d5f8dd52/eyJ3IjoyMDB9/3.jpg?token-hash=5FngEN5rK-hCAgHUM0EybhMTuHwRZI1gbbZyntuuH6g%3D" alt="Adel Gamal" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/128259665/7e7627e6442141cdbb8b3a32e590fe5d/eyJ3IjoyMDB9/1.jpeg?token-hash=cnTHMo5sfgLnxVek5QvWEyLBUTmEdLaKcs_8AJbVfbc%3D" alt="Bennett Waisbren" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/24216005/ac538de1daa04619810352e62cd962ec/eyJ3IjoyMDB9/2.jpeg?token-hash=VqZ4vz2lfvrB85QNUng-OB7HLmGZ8Yp85Ay7xCb7xsM%3D" alt="Brian Buie" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/42375181/a8d4b6dd849c47d596ba1d49e165b658/eyJ3IjoyMDB9/1.jpeg?token-hash=vmkkWAHO-Vv-drVE3JpiLd9MquixdYnV0pxhKmay0AU%3D" alt="Charles Blakemore" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/claygraffix" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/1283083?v=4" alt="claygraffix" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="David Hooper" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/21723124/D" alt="Dhruv Sharma" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/201405121/7fc9ef651c6b4a8faea2acd2d1a82cae/eyJ3IjoyMDB9/1.jpeg?token-hash=Q-ACM_hIPVWRfd5CKGl2qrzoHb5Mh5PARNAyKjtZcV0%3D" alt="Evan Forster" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/91434404/G" alt="GameChanger" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/24294031/16731f3bdacb4a1cb987ec7636e08213/eyJ3IjoyMDB9/1.jpg?token-hash=Df1rhYbhEwtrff3hKbn-lflr1ZDp_KtvDzW4GrBisw8%3D" alt="H.W.Prinz" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/77680244/5e14634dac41465780c28f53b1d6b9d6/eyJ3IjoyMDB9/1.png?token-hash=5TMuHTgcLFmFlJK-TNUEIywxwwYXv2y1kZNDCibgePU%3D" alt="james salanitri" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/2361841/J" alt="Jason Briney" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Rudolf Goertz" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/ShinChven" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/3351486?u=a70586ea24bb3acadab3019083e78500ddeab641&v=4" alt="ShinChven ✨" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Tommy Falkowski" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Victor-Ray Valdez" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/774502/902857342f834c08a68a7b13b554e078/eyJ3IjoyMDB9/2.jpeg?token-hash=usMsTs8b58b1mJR9PQhM9KsuU1eewl6B90oWRuyaWDI%3D" alt="Wolkenfels " width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/Jefferderp" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/13530594?v=4" alt="Jefferderp" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/181113408/59fb8db40ca944c2897a295dcfed7340/eyJ3IjoyMDB9/1.png?token-hash=E9iFUUk_Q0cV0gkbiLhLkKwvgPhHTdvalcQsE9hLfd4%3D" alt="John D" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/ekgreen7" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/65423214?v=4" alt="ekgreen7" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<a href="https://github.com/marksverdhei" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/46672778?u=d1ba8b17516e6ecf1cd55ca4db2b770f82285aad&v=4" alt="Markus / Mark" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Alex Kovalchuk" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Florian Fiegl" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Kai Buddensiek" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Karol Stępień" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="manuel landron" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Paul Vu Nguyen" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/157177642/cac4925553f74deb9f9285781839fba8/eyJ3IjoyMDB9/1.png?token-hash=osNeLRXRgvuWKAviRBcPjHzWJFh61MdRtjVgivdeZl0%3D" alt="R132" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/204926456/739abd8abc2f4deb965fdacfb5bd7edf/eyJ3IjoyMDB9/1.jpeg?token-hash=ALGKzAFFxxFmwKGb44pmH8A-9sjUPJQEIXXjmWdWIw0%3D" alt="Mal Mallabar" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/76554725/M" alt="Moritz Hutten" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/137558630/04e82f23d76b4e049102529b2ae4693f/eyJ3IjoyMDB9/1.jpeg?token-hash=aA2XcIi-yQske0sUj-L_X4ASuCLRWCBFaAmvUKqaMY8%3D" alt="AAYUSH BHADANI" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/148105261/20988aa43bec4c38ad1293cfd7c8677f/eyJ3IjoyMDB9/1.png?token-hash=YZp1Sdn13WFKXLlJMtSxdjrJ7aHmo15-PbKD7DcBzmU%3D" alt="Chris Williams" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c8.patreon.com/4/200/15533741/D" alt="Dfence" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/36227336/2d5602535ca64301a5555c7c027042c6/eyJ3IjoyMDB9/1.jpeg?token-hash=EglM8DWBx6fMiL_9oOJddZCTYYlpv07jL0OVhxsI7Rk%3D" alt="Greg Abousleman" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/56699680/c88d90b3e35d46829060b34d0f2eac2f/eyJ3IjoyMDB9/1.png?token-hash=_zJfEDVMADBdti9FAJc-IdNmyjq7Iog4m8ebs70OPcE%3D" alt="Khaleesi" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<a href="https://github.com/ProPatte" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/228614493?u=45908a4a76165a83ce0b20a474a4d7fd027d67af&v=4" alt="ProPatte" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;"></a>
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Boris HANSSEN" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Juan Franco" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://c10.patreonusercontent.com/4/patreon-media/p/user/204605240/919185a084784f3bac95b87a55bee31a/eyJ3IjoyMDB9/1.png?token-hash=FCOZQAwgr9gjwLh0723VC_QwKxmrT7GrWtHtjkXqtBg%3D" alt="Edwin Bustillos" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-<img src="https://ostris.com/wp-content/uploads/2025/08/supporter_default.jpg" alt="Fabrizio Pasqualicchio" width="60" height="60" style="border-radius:8px;margin:5px;display: inline-block;">
-</p>
 
 ---
 
@@ -296,16 +496,15 @@ _Last updated: 2026-03-03 15:01 UTC_
 ## Installation
 
 Requirements:
-- python >3.10
-- Nvidia GPU with enough ram to do what you need
-- python venv
+- Python >3.10
+- Nvidia GPU with enough VRAM for what you're training
+- Python venv
 - git
-
 
 Linux:
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
+git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.git
+cd ai-toolkit-perceptual
 python3 -m venv venv
 source venv/bin/activate
 # install torch first
@@ -313,311 +512,15 @@ pip3 install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 -
 pip3 install -r requirements.txt
 ```
 
-For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
-
-
 Windows:
-
-If you are having issues with Windows. I recommend using the easy install script at [https://github.com/Tavris1/AI-Toolkit-Easy-Install](https://github.com/Tavris1/AI-Toolkit-Easy-Install)
-
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
+git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.git
+cd ai-toolkit-perceptual
 python -m venv venv
 .\venv\Scripts\activate
 pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 
+For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
 
-# AI Toolkit UI
-
-<img src="https://ostris.com/wp-content/uploads/2025/02/toolkit-ui.jpg" alt="AI Toolkit UI" width="100%">
-
-The AI Toolkit UI is a web interface for the AI Toolkit. It allows you to easily start, stop, and monitor jobs. It also allows you to easily train models with a few clicks. It also allows you to set a token for the UI to prevent unauthorized access so it is mostly safe to run on an exposed server.
-
-## Running the UI
-
-Requirements:
-- Node.js > 18
-
-The UI does not need to be kept running for the jobs to run. It is only needed to start/stop/monitor jobs. The commands below
-will install / update the UI and it's dependencies and start the UI. 
-
-```bash
-cd ui
-npm run build_and_start
-```
-
-You can now access the UI at `http://localhost:8675` or `http://<your-ip>:8675` if you are running it on a server.
-
-## Securing the UI
-
-If you are hosting the UI on a cloud provider or any network that is not secure, I highly recommend securing it with an auth token. 
-You can do this by setting the environment variable `AI_TOOLKIT_AUTH` to super secure password. This token will be required to access
-the UI. You can set this when starting the UI like so:
-
-```bash
-# Linux
-AI_TOOLKIT_AUTH=super_secure_password npm run build_and_start
-
-# Windows
-set AI_TOOLKIT_AUTH=super_secure_password && npm run build_and_start
-
-# Windows Powershell
-$env:AI_TOOLKIT_AUTH="super_secure_password"; npm run build_and_start
-```
-
-
-## FLUX.1 Training
-
-### Tutorial
-
-To get started quickly, check out [@araminta_k](https://x.com/araminta_k) tutorial on [Finetuning Flux Dev on a 3090](https://www.youtube.com/watch?v=HzGW_Kyermg) with 24GB VRAM.
-
-
-### Requirements
-You currently need a GPU with **at least 24GB of VRAM** to train FLUX.1. If you are using it as your GPU to control 
-your monitors, you probably need to set the flag `low_vram: true` in the config file under `model:`. This will quantize
-the model on CPU and should allow it to train with monitors attached. Users have gotten it to work on Windows with WSL,
-but there are some reports of a bug when running on windows natively. 
-I have only tested on linux for now. This is still extremely experimental
-and a lot of quantizing and tricks had to happen to get it to fit on 24GB at all. 
-
-### FLUX.1-dev
-
-FLUX.1-dev has a non-commercial license. Which means anything you train will inherit the
-non-commercial license. It is also a gated model, so you need to accept the license on HF before using it.
-Otherwise, this will fail. Here are the required steps to setup a license.
-
-1. Sign into HF and accept the model access here [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
-2. Make a file named `.env` in the root on this folder
-3. [Get a READ key from huggingface](https://huggingface.co/settings/tokens/new?) and add it to the `.env` file like so `HF_TOKEN=your_key_here`
-
-### FLUX.1-schnell
-
-FLUX.1-schnell is Apache 2.0. Anything trained on it can be licensed however you want and it does not require a HF_TOKEN to train.
-However, it does require a special adapter to train with it, [ostris/FLUX.1-schnell-training-adapter](https://huggingface.co/ostris/FLUX.1-schnell-training-adapter).
-It is also highly experimental. For best overall quality, training on FLUX.1-dev is recommended.
-
-To use it, You just need to add the assistant to the `model` section of your config file like so:
-
-```yaml
-      model:
-        name_or_path: "black-forest-labs/FLUX.1-schnell"
-        assistant_lora_path: "ostris/FLUX.1-schnell-training-adapter"
-        is_flux: true
-        quantize: true
-```
-
-You also need to adjust your sample steps since schnell does not require as many
-
-```yaml
-      sample:
-        guidance_scale: 1  # schnell does not do guidance
-        sample_steps: 4  # 1 - 4 works well
-```
-
-### Training
-1. Copy the example config file located at `config/examples/train_lora_flux_24gb.yaml` (`config/examples/train_lora_flux_schnell_24gb.yaml` for schnell) to the `config` folder and rename it to `whatever_you_want.yml`
-2. Edit the file following the comments in the file
-3. Run the file like so `python run.py config/whatever_you_want.yml`
-
-A folder with the name and the training folder from the config file will be created when you start. It will have all 
-checkpoints and images in it. You can stop the training at any time using ctrl+c and when you resume, it will pick back up
-from the last checkpoint.
-
-IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
-
-### Need help?
-
-Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)
-and ask for help there. However, please refrain from PMing me directly with general question or support. Ask in the discord
-and I will answer when I can.
-
-## Gradio UI
-
-To get started training locally with a with a custom UI, once you followed the steps above and `ai-toolkit` is installed:
-
-```bash
-cd ai-toolkit #in case you are not yet in the ai-toolkit folder
-huggingface-cli login #provide a `write` token to publish your LoRA at the end
-python flux_train_ui.py
-```
-
-You will instantiate a UI that will let you upload your images, caption them, train and publish your LoRA
-![image](assets/lora_ease_ui.png)
-
-
-## Training in RunPod
-If you would like to use Runpod, but have not signed up yet, please consider using [my Runpod affiliate link](https://runpod.io?ref=h0y9jyr2) to help support this project.
-
-
-I maintain an official Runpod Pod template here which can be accessed [here](https://console.runpod.io/deploy?template=0fqzfjy6f3&ref=h0y9jyr2).
-
-I have also created a short video showing how to get started using AI Toolkit with Runpod [here](https://youtu.be/HBNeS-F6Zz8).
-
-## Training in Modal
-
-### 1. Setup
-#### ai-toolkit:
-```
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
-git submodule update --init --recursive
-python -m venv venv
-source venv/bin/activate
-pip install torch
-pip install -r requirements.txt
-pip install --upgrade accelerate transformers diffusers huggingface_hub #Optional, run it if you run into issues
-```
-#### Modal:
-- Run `pip install modal` to install the modal Python package.
-- Run `modal setup` to authenticate (if this doesn’t work, try `python -m modal setup`).
-
-#### Hugging Face:
-- Get a READ token from [here](https://huggingface.co/settings/tokens) and request access to Flux.1-dev model from [here](https://huggingface.co/black-forest-labs/FLUX.1-dev).
-- Run `huggingface-cli login` and paste your token.
-
-### 2. Upload your dataset
-- Drag and drop your dataset folder containing the .jpg, .jpeg, or .png images and .txt files in `ai-toolkit`.
-
-### 3. Configs
-- Copy an example config file located at ```config/examples/modal``` to the `config` folder and rename it to ```whatever_you_want.yml```.
-- Edit the config following the comments in the file, **<ins>be careful and follow the example `/root/ai-toolkit` paths</ins>**.
-
-### 4. Edit run_modal.py
-- Set your entire local `ai-toolkit` path at `code_mount = modal.Mount.from_local_dir` like:
-  
-   ```
-   code_mount = modal.Mount.from_local_dir("/Users/username/ai-toolkit", remote_path="/root/ai-toolkit")
-   ```
-- Choose a `GPU` and `Timeout` in `@app.function` _(default is A100 40GB and 2 hour timeout)_.
-
-### 5. Training
-- Run the config file in your terminal: `modal run run_modal.py --config-file-list-str=/root/ai-toolkit/config/whatever_you_want.yml`.
-- You can monitor your training in your local terminal, or on [modal.com](https://modal.com/).
-- Models, samples and optimizer will be stored in `Storage > flux-lora-models`.
-
-### 6. Saving the model
-- Check contents of the volume by running `modal volume ls flux-lora-models`. 
-- Download the content by running `modal volume get flux-lora-models your-model-name`.
-- Example: `modal volume get flux-lora-models my_first_flux_lora_v1`.
-
-### Screenshot from Modal
-
-<img width="1728" alt="Modal Traning Screenshot" src="https://github.com/user-attachments/assets/7497eb38-0090-49d6-8ad9-9c8ea7b5388b">
-
----
-
-## Dataset Preparation
-
-Datasets generally need to be a folder containing images and associated text files. Currently, the only supported
-formats are jpg, jpeg, and png. Webp currently has issues. The text files should be named the same as the images
-but with a `.txt` extension. For example `image2.jpg` and `image2.txt`. The text file should contain only the caption.
-You can add the word `[trigger]` in the caption file and if you have `trigger_word` in your config, it will be automatically
-replaced. 
-
-Images are never upscaled but they are downscaled and placed in buckets for batching. **You do not need to crop/resize your images**.
-The loader will automatically resize them and can handle varying aspect ratios. 
-
-
-## Training Specific Layers
-
-To train specific layers with LoRA, you can use the `only_if_contains` network kwargs. For instance, if you want to train only the 2 layers
-used by The Last Ben, [mentioned in this post](https://x.com/__TheBen/status/1829554120270987740), you can adjust your
-network kwargs like so:
-
-```yaml
-      network:
-        type: "lora"
-        linear: 128
-        linear_alpha: 128
-        network_kwargs:
-          only_if_contains:
-            - "transformer.single_transformer_blocks.7.proj_out"
-            - "transformer.single_transformer_blocks.20.proj_out"
-```
-
-The naming conventions of the layers are in diffusers format, so checking the state dict of a model will reveal 
-the suffix of the name of the layers you want to train. You can also use this method to only train specific groups of weights.
-For instance to only train the `single_transformer` for FLUX.1, you can use the following:
-
-```yaml
-      network:
-        type: "lora"
-        linear: 128
-        linear_alpha: 128
-        network_kwargs:
-          only_if_contains:
-            - "transformer.single_transformer_blocks."
-```
-
-You can also exclude layers by their names by using `ignore_if_contains` network kwarg. So to exclude all the single transformer blocks,
-
-
-```yaml
-      network:
-        type: "lora"
-        linear: 128
-        linear_alpha: 128
-        network_kwargs:
-          ignore_if_contains:
-            - "transformer.single_transformer_blocks."
-```
-
-`ignore_if_contains` takes priority over `only_if_contains`. So if a weight is covered by both,
-if will be ignored.
-
-## LoKr Training
-
-To learn more about LoKr, read more about it at [KohakuBlueleaf/LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md). To train a LoKr model, you can adjust the network type in the config file like so:
-
-```yaml
-      network:
-        type: "lokr"
-        lokr_full_rank: true
-        lokr_factor: 8
-```
-
-Everything else should work the same including layer targeting.
-
-
-## Updates
-
-Only larger updates are listed here. There are usually smaller daily updated that are omitted.
-
-### Jul 17, 2025
-- Make it easy to add control images to the samples in the ui
-
-### Jul 11, 2025
-- Added better video config settings to the UI for video models.
-- Added Wan I2V training to the UI
-
-### June 29, 2025
-- Fixed issue where Kontext forced sizes on sampling
-
-### June 26, 2025
-- Added support for FLUX.1 Kontext training
-- added support for instruction dataset training
-
-### June 25, 2025
-- Added support for OmniGen2 training
-- 
-### June 17, 2025
-- Performance optimizations for batch preparation
-- Added some docs via a popup for items in the simple ui explaining what settings do. Still a WIP
-
-### June 16, 2025
-- Hide control images in the UI when viewing datasets
-- WIP on mean flow loss
-
-### June 12, 2025
-- Fixed issue that resulted in blank captions in the dataloader
-
-### June 10, 2025
-- Decided to keep track up updates in the readme
-- Added support for SDXL in the UI
-- Added support for SD 1.5 in the UI
-- Fixed UI Wan 2.1 14b name bug
-- Added support for for conv training in the UI for models that support it
