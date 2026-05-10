@@ -540,6 +540,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
+        # Log unique captions so user can see what text gets encoded
+        _seen_captions = set()
+        for fi in self.file_list:
+            fi.load_caption(self.caption_dict)
+            cap = fi.caption or fi.raw_caption or ''
+            if cap and cap not in _seen_captions:
+                _seen_captions.add(cap)
+        if _seen_captions:
+            print_acc(f"  -  Captions ({len(_seen_captions)} unique):")
+            for cap in sorted(_seen_captions):
+                print_acc(f"       {cap[:150]}")
+
         # handle x axis flips
         if self.dataset_config.flip_x:
             print_acc("  -  adding x axis flips")

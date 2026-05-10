@@ -1,4 +1,4 @@
-import { JobConfig, DatasetConfig, SliderConfig } from '@/types';
+import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -17,6 +17,52 @@ export const defaultDatasetConfig: DatasetConfig = {
   flip_x: false,
   flip_y: false,
   num_repeats: 1,
+};
+
+export const defaultFaceIDConfig: FaceIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  face_model: 'buffalo_l',
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
+  vision_enabled: false,
+  vision_model: 'openai/clip-vit-large-patch14',
+  vision_num_tokens: 4,
+  vision_crop_padding: 0.3,
+  identity_loss_weight: 0.0,
+  identity_loss_min_t: 0.0,
+  identity_loss_max_t: 1.0,
+  identity_loss_min_cos: 0.2,
+  identity_loss_use_average: true,
+  identity_loss_average_blend: 0.0,
+  identity_loss_use_random: false,
+  identity_loss_num_refs: 0,
+  identity_metrics: false,
+  landmark_loss_weight: 0.0,
+  body_proportion_loss_weight: 0.0,
+  body_proportion_loss_min_t: 0.0,
+  body_proportion_loss_max_t: 1.0,
+  body_proportion_include_head: false,
+  body_shape_loss_weight: 0.0,
+  body_shape_loss_min_t: 0.4,
+  body_shape_loss_max_t: 0.8,
+  normal_loss_weight: 0.0,
+  normal_loss_min_t: 0.4,
+  normal_loss_max_t: 0.8,
+  vae_anchor_loss_weight: 0,
+  vae_anchor_loss_min_t: 0,
+  vae_anchor_loss_max_t: 0.5,
+  vae_anchor_model_path: '',
+};
+
+export const defaultBodyIDConfig: BodyIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  detection_threshold: 0.5,
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
 };
 
 export const defaultSliderConfig: SliderConfig = {
@@ -52,6 +98,8 @@ export const defaultJobConfig: JobConfig = {
             ignore_if_contains: [],
           },
         },
+        face_id: { ...defaultFaceIDConfig },
+        body_id: { ...defaultBodyIDConfig },
         save: {
           dtype: 'bf16',
           save_every: 250,
@@ -91,6 +139,12 @@ export const defaultJobConfig: JobConfig = {
           diff_output_preservation_class: 'person',
           switch_boundary_every: 1,
           loss_type: 'mse',
+          diffusion_loss_weight: 1.0,
+          diffusion_loss_min_t: 0.0,
+          diffusion_loss_max_t: 1.0,
+          latent_perceptual_loss_weight: 0.0,
+          latent_perceptual_loss_min_t: 0.0,
+          latent_perceptual_loss_max_t: 0.5,
         },
         logging: {
           log_every: 1,

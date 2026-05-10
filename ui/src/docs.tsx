@@ -329,6 +329,228 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'perceptual_anchoring': {
+    title: 'Perceptual Anchoring',
+    description: (
+      <>
+        Perceptual anchoring uses frozen perception models (ArcFace, ViTPose) to compare the training model's
+        predictions against reference images during training. This anchors the model's output to match the identity
+        and body proportions of the training subject, preventing drift and distortion.
+        <br /><br />
+        <b>Face ID Conditioning</b> injects identity tokens into the model so the LoRA embeds identity directly.
+        <b>Identity Loss</b> and <b>Body Proportion Loss</b> compare predicted outputs against reference embeddings.
+        <b>Face Suppression</b> dampens or eliminates face learning — use it standalone to train on a dataset
+        without memorizing the faces (e.g. for style or clothing LoRAs).
+        <br /><br />
+        All perception models download automatically on first use.
+      </>
+    ),
+  },
+  'face_id.enabled': {
+    title: 'Face ID Conditioning',
+    description: (
+      <>
+        Enables face identity conditioning for LoRA training. Part of the perceptual anchoring system.
+        Face embeddings are extracted from your training images using ArcFace and injected as conditioning
+        tokens during training. The trained LoRA embeds identity information, allowing identity-preserving
+        generation at inference time.
+        <br /><br />
+        Models are downloaded automatically on first use (~250MB for ArcFace).
+      </>
+    ),
+  },
+  'face_id.num_tokens': {
+    title: 'Face Tokens',
+    description: (
+      <>
+        Number of identity embedding tokens injected into the model. More tokens can capture finer identity detail
+        but increase compute and can lead to overfitting on small datasets. 4 tokens is a good default for most use cases.
+      </>
+    ),
+  },
+  'face_id.dropout_prob': {
+    title: 'Face Dropout',
+    description: (
+      <>
+        Probability of dropping all identity tokens during a training step. This acts as regularization — the model
+        learns to generate both with and without identity conditioning, preventing over-reliance on the ID signal.
+        0.1 (10%) is a good default.
+      </>
+    ),
+  },
+  'face_id.scale_lr_multiplier': {
+    title: 'Scale LR Multiplier',
+    description: (
+      <>
+        Learning rate multiplier for the output scale parameter of identity projectors. The output scale starts near
+        zero and ramps up during training. A higher multiplier (e.g. 10x) lets the scale ramp faster. Increase if
+        identity signal is too weak; decrease if it overwhelms other losses.
+      </>
+    ),
+  },
+  'face_id.init_scale': {
+    title: 'Init Scale',
+    description: (
+      <>
+        Initial value of the identity projector output scale. A small value (0.01) ensures identity tokens start
+        near-zero and gradually increase their influence. This prevents the identity signal from destabilizing
+        early training. Values between 0.001 and 0.1 work well.
+      </>
+    ),
+  },
+  'face_id.identity_metrics': {
+    title: 'Identity Metrics',
+    description: (
+      <>
+        When enabled, tracks face identity similarity (cosine similarity between predicted and reference ArcFace
+        embeddings) in the training log without applying any loss. Useful for monitoring how well identity is preserved
+        during regular training, or when you only want body proportion loss without identity loss.
+      </>
+    ),
+  },
+  'face_id.identity_loss_weight': {
+    title: 'Identity Loss Weight',
+    description: (
+      <>
+        Weight for the ArcFace identity perceptual anchor. This loss compares face embeddings between the
+        model's predicted output and the reference training image, anchoring the model to preserve facial identity.
+        <br /><br />
+        Start with 0.01–0.1. Set to 0 to disable.
+      </>
+    ),
+  },
+  'face_id.identity_loss_min_t': {
+    title: 'Identity Loss Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio for applying identity loss. The loss is only computed when the current
+        timestep falls within [min_t, max_t].
+        <br /><br />
+        Default: 0. Set to 0 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.identity_loss_max_t': {
+    title: 'Identity Loss Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio for applying identity loss.
+        <br /><br />
+        Default: 1. Set to 1 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.identity_loss_min_cos': {
+    title: 'Identity Loss Min Cosine',
+    description: (
+      <>
+        Minimum cosine similarity threshold to apply the identity loss for a given sample. If the predicted face
+        embedding similarity is below this threshold, the loss is skipped — this prevents the loss from pushing
+        on samples where no face was detected or the prediction is pure noise.
+        <br /><br />
+        Default: 0.2. Lower to be less strict; raise to only apply loss when a clear face is present.
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_average': {
+    title: 'Use Average Face Embedding',
+    description: (
+      <>
+        When enabled, compares predictions against the average face embedding across the entire dataset instead of
+        the per-image embedding. This can help when individual images have varying quality or angles, providing a
+        more stable identity target. Use the Average Blend slider to interpolate between per-image and average.
+      </>
+    ),
+  },
+  'face_id.identity_loss_average_blend': {
+    title: 'Average Blend',
+    description: (
+      <>
+        Controls the blend between per-image and dataset-average face embeddings.
+        0 = use only per-image embedding, 1 = use only the dataset average, 0.5 = midpoint.
+        <br /><br />
+        Useful for balancing per-image accuracy with dataset-wide identity consistency.
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_random': {
+    title: 'Use Random Face Embedding',
+    description: (
+      <>
+        When enabled, each training step picks a random face embedding from the dataset instead of using the
+        one matching the current image. This adds diversity to the identity target and can improve robustness
+        when images have varying poses or expressions.
+      </>
+    ),
+  },
+  'face_id.identity_loss_num_refs': {
+    title: 'Multi-Ref Count',
+    description: (
+      <>
+        Number of random reference embeddings to compare against each step. When greater than 0, the loss averages
+        the cosine similarity across K random references. Set to 0 to use a single reference per step.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_weight': {
+    title: 'Body Proportion Loss Weight',
+    description: (
+      <>
+        Weight for the ViTPose body proportion perceptual anchor. This loss compares pose-invariant bone-length
+        ratios between the model's predicted output and the reference training image, anchoring the model to
+        preserve body proportions (limb lengths, torso ratio, etc.) regardless of pose.
+        <br /><br />
+        Start with 0.1–0.2. The ViTPose model (~350MB) downloads automatically from HuggingFace on first use.
+        Set to 0 to disable.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_min_t': {
+    title: 'Body Proportion Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio for applying body proportion loss.
+        <br /><br />
+        Default: 0. Set to 0 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_max_t': {
+    title: 'Body Proportion Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio for applying body proportion loss.
+        <br /><br />
+        Default: 1.
+      </>
+    ),
+  },
+  'face_id.face_suppression_weight': {
+    title: 'Face Suppression Weight',
+    description: (
+      <>
+        Dampens or eliminates the model's ability to learn faces from the training data by downweighting
+        the diffusion loss inside detected face bounding boxes. Use this as a standalone setting when you
+        want to train on a dataset without memorizing the faces — for example, training a style or clothing
+        LoRA while preventing it from reproducing the faces of people in the images.
+        <br /><br />
+        0 = no suppression (normal), 0.5 = half face learning, 1 = full suppression (no face learning).
+        Leave empty for no suppression. Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'face_id.vision_enabled': {
+    title: 'Vision Face Embeddings',
+    description: (
+      <>
+        Enables an additional CLIP or DINOv2 vision encoder for richer face detail conditioning. Face crops are
+        encoded through the vision model and injected as additional conditioning tokens. This captures fine-grained
+        visual details (hairstyle, accessories, skin texture) that ArcFace alone may miss.
+        <br /><br />
+        Increases VRAM usage. Optional — ArcFace alone works well for most identity tasks.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

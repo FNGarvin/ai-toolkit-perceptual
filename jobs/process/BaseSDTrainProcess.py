@@ -98,6 +98,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.start_step = 0
         self.epoch_num = 0
         self.last_save_step = 0
+        # epoch loss accumulation
+        self._epoch_loss_sum = 0.0
+        self._epoch_loss_count = 0
+        self._pending_epoch_avg = None  # set at epoch boundary, logged then cleared
+        # identity loss epoch accumulation
+        self._id_loss_epoch_sum = 0.0
+        self._id_loss_epoch_count = 0
+        self._pending_id_loss_epoch_avg = None
+        # id sim epoch accumulation
+        self._id_sim_epoch_sum = 0.0
+        self._id_sim_epoch_count = 0
+        self._pending_id_sim_epoch_avg = None
+        # diffusion loss epoch accumulation
+        self._diff_loss_epoch_sum = 0.0
+        self._diff_loss_epoch_count = 0
+        self._pending_diff_loss_epoch_avg = None
+        # body proportion loss epoch accumulation
+        self._bp_loss_epoch_sum = 0.0
+        self._bp_loss_epoch_count = 0
+        self._pending_bp_loss_epoch_avg = None
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -374,6 +394,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
 
+        # Free VRAM from sampling pipeline before training resumes
+        flush()
+
     def update_training_metadata(self):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
@@ -536,6 +559,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # if we are doing embedding training as well, add that
                 embedding_dict = self.embedding.state_dict() if self.embedding else None
+
+                # merge identity projectors + averaged embeddings if available
+                identity_dict = self._get_identity_state_dict() if hasattr(self, '_get_identity_state_dict') else None
+                if identity_dict:
+                    import json as _json
+                    if embedding_dict is None:
+                        embedding_dict = identity_dict
+                    else:
+                        embedding_dict.update(identity_dict)
+                    save_meta['identity_enhanced'] = 'true'
+                    if hasattr(self, 'face_id_config') and self.face_id_config and self.face_id_config.enabled:
+                        save_meta['face_id_config'] = _json.dumps({
+                            'num_tokens': self.face_id_config.num_tokens,
+                            'vision_enabled': self.face_id_config.vision_enabled,
+                            'vision_num_tokens': self.face_id_config.vision_num_tokens,
+                        })
+                    if hasattr(self, 'body_id_config') and self.body_id_config and self.body_id_config.enabled:
+                        save_meta['body_id_config'] = _json.dumps({
+                            'num_tokens': self.body_id_config.num_tokens,
+                        })
+
                 self.network.save_weights(
                     file_path,
                     dtype=get_torch_dtype(self.save_config.dtype),
@@ -1329,6 +1373,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     ) * self.train_config.signal_correction_noise_scale
                     batch_noise = batch_noise * scn_scale
                     noise = noise + batch_noise 
+                
+                if self.train_config.do_batch_noise_correction:
+                    if latents.shape[0] == 1:
+                        # if we only have a batch size of 1, then we cant do batch noise correction, so we skip it
+                        print_acc("Skipping batch noise correction because batch size is 1, increase batch size and num_repeats to use this feature")
+                    else:
+                        # shuffle tensors ensuring that no tensor is in the same position as before
+                        batch_noise = latents.clone().roll(shifts=torch.randint(1, latents.shape[0], (1,)).item(), dims=0).to(noise.device, dtype=noise.dtype)
+                        batch_noise_scale = torch.randn(
+                            batch_noise.shape[0], batch_noise.shape[1], 1, 1,
+                            device=batch_noise.device,
+                            dtype=batch_noise.dtype
+                        ) * self.train_config.batch_noise_correction_scale
+                        batch_noise = batch_noise * batch_noise_scale
+                        noise = noise + batch_noise
                 
                 if self.train_config.random_noise_shift > 0.0:
                     # get random noise -1 to 1
@@ -2163,6 +2222,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
                                 self.epoch_num += 1
+                                if self._epoch_loss_count > 0:
+                                    self._pending_epoch_avg = self._epoch_loss_sum / self._epoch_loss_count
+                                    self._epoch_loss_sum = 0.0
+                                    self._epoch_loss_count = 0
+                                if self._id_loss_epoch_count > 0:
+                                    self._pending_id_loss_epoch_avg = self._id_loss_epoch_sum / self._id_loss_epoch_count
+                                    self._id_loss_epoch_sum = 0.0
+                                    self._id_loss_epoch_count = 0
+                                if self._diff_loss_epoch_count > 0:
+                                    self._pending_diff_loss_epoch_avg = self._diff_loss_epoch_sum / self._diff_loss_epoch_count
+                                    self._diff_loss_epoch_sum = 0.0
+                                    self._diff_loss_epoch_count = 0
+                                if self._id_sim_epoch_count > 0:
+                                    self._pending_id_sim_epoch_avg = self._id_sim_epoch_sum / self._id_sim_epoch_count
+                                    self._id_sim_epoch_sum = 0.0
+                                    self._id_sim_epoch_count = 0
+                                if self._bp_loss_epoch_count > 0:
+                                    self._pending_bp_loss_epoch_avg = self._bp_loss_epoch_sum / self._bp_loss_epoch_count
+                                    self._bp_loss_epoch_sum = 0.0
+                                    self._bp_loss_epoch_count = 0
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
@@ -2254,6 +2333,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
+                    # accumulate for epoch average
+                    if 'loss' in loss_dict:
+                        self._epoch_loss_sum += loss_dict['loss']
+                        self._epoch_loss_count += 1
+                    if 'identity_loss' in loss_dict:
+                        self._id_loss_epoch_sum += loss_dict['identity_loss']
+                        self._id_loss_epoch_count += 1
+                    if 'diffusion_loss' in loss_dict:
+                        self._diff_loss_epoch_sum += loss_dict['diffusion_loss']
+                        self._diff_loss_epoch_count += 1
+                    if 'id_sim' in loss_dict:
+                        self._id_sim_epoch_sum += loss_dict['id_sim']
+                        self._id_sim_epoch_count += 1
+                    if 'body_proportion_loss' in loss_dict:
+                        self._bp_loss_epoch_sum += loss_dict['body_proportion_loss']
+                        self._bp_loss_epoch_count += 1
+
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
@@ -2314,9 +2410,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
                                         self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                    if self._pending_epoch_avg is not None:
+                                        self.writer.add_scalar("epoch_avg_loss", self._pending_epoch_avg, self.step_num)
+                                    if self._pending_id_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("identity_loss_epoch_avg", self._pending_id_loss_epoch_avg, self.step_num)
+                                    if self._pending_diff_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("diffusion_loss_epoch_avg", self._pending_diff_loss_epoch_avg, self.step_num)
+                                    if self._pending_id_sim_epoch_avg is not None:
+                                        self.writer.add_scalar("id_sim_epoch_avg", self._pending_id_sim_epoch_avg, self.step_num)
+                                    if self._pending_bp_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("body_proportion_loss_epoch_avg", self._pending_bp_loss_epoch_avg, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
-                        
+
                         if self.accelerator.is_main_process:
                             # log to logger
                             self.logger.log({
@@ -2324,9 +2430,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             })
                             if loss_dict is not None:
                                 for key, value in loss_dict.items():
-                                    self.logger.log({
-                                        f'loss/{key}': value,
-                                    })
+                                    if key == 'loss' or key.startswith('loss'):
+                                        self.logger.log({f'loss/{key}': value})
+                                    else:
+                                        self.logger.log({key: value})
+                            if self._pending_epoch_avg is not None:
+                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
+                                self._pending_epoch_avg = None
+                            if self._pending_id_loss_epoch_avg is not None:
+                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
+                                self._pending_id_loss_epoch_avg = None
+                            if self._pending_diff_loss_epoch_avg is not None:
+                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
+                                self._pending_diff_loss_epoch_avg = None
+                            if self._pending_id_sim_epoch_avg is not None:
+                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
+                                self._pending_id_sim_epoch_avg = None
+                            if self._pending_bp_loss_epoch_avg is not None:
+                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
+                                self._pending_bp_loss_epoch_avg = None
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2334,9 +2456,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
+                                if key == 'loss' or key.startswith('loss'):
+                                    self.logger.log({f'loss/{key}': value})
+                                else:
+                                    self.logger.log({key: value})
+                            if self._pending_epoch_avg is not None:
+                                self.logger.log({'loss/epoch_avg': self._pending_epoch_avg})
+                                self._pending_epoch_avg = None
+                            if self._pending_id_loss_epoch_avg is not None:
+                                self.logger.log({'loss/identity_loss_epoch_avg': self._pending_id_loss_epoch_avg})
+                                self._pending_id_loss_epoch_avg = None
+                            if self._pending_diff_loss_epoch_avg is not None:
+                                self.logger.log({'loss/diffusion_loss_epoch_avg': self._pending_diff_loss_epoch_avg})
+                                self._pending_diff_loss_epoch_avg = None
+                            if self._pending_id_sim_epoch_avg is not None:
+                                self.logger.log({'id_sim_epoch_avg': self._pending_id_sim_epoch_avg})
+                                self._pending_id_sim_epoch_avg = None
+                            if self._pending_bp_loss_epoch_avg is not None:
+                                self.logger.log({'loss/body_proportion_loss_epoch_avg': self._pending_bp_loss_epoch_avg})
+                                self._pending_bp_loss_epoch_avg = None
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:

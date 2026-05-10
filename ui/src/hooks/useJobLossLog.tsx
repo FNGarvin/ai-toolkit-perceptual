@@ -11,10 +11,9 @@ export interface LossPoint {
 
 type SeriesMap = Record<string, LossPoint[]>;
 
-function isLossKey(key: string) {
-  // treat anything containing "loss" as a loss-series
-  // (covers loss, train_loss, val_loss, loss/xyz, etc.)
-  return /loss/i.test(key);
+function isGraphableKey(key: string) {
+  // treat anything containing "loss", "grad_norm", or "face_token_norm" as a graphable series
+  return /loss|grad_norm|face_token_norm|txt_token_norm|vision_token_norm|body_token_norm|timestep|id_sim|shape_sim|bp_sim|bsh_sim|body_shape_cos|body_shape_l1|body_shape_gated|normal_cos|normal_loss|pure_noise|va_level|va_mid|va_edge/i.test(key);
 }
 
 export default function useJobLossLog(jobID: string, reloadInterval: null | number = null) {
@@ -29,7 +28,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
   const lastStepByKeyRef = useRef<Record<string, number | null>>({});
 
   const lossKeys = useMemo(() => {
-    const base = (keys ?? []).filter(isLossKey);
+    const base = (keys ?? []).filter(isGraphableKey);
     // if keys table is empty early on, fall back to just "loss"
     if (base.length === 0) return ['loss'];
     return base.sort();
@@ -54,7 +53,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
       const newKeys = first.keys ?? [];
       setKeys(newKeys);
 
-      const wantedLossKeys = (newKeys.filter(isLossKey).length ? newKeys.filter(isLossKey) : ['loss']).sort();
+      const wantedLossKeys = (newKeys.filter(isGraphableKey).length ? newKeys.filter(isGraphableKey) : ['loss']).sort();
 
       // Step 2: fetch each loss key incrementally (since_step per key if polling)
       const requests = wantedLossKeys.map(k => {
@@ -64,8 +63,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
           params.since_step = lastStepByKeyRef.current[k];
         }
 
-        // keep default limit from server (or set explicitly if you want)
-        // params.limit = 2000;
+        params.limit = 1000000;
 
         return apiClient
           .get(`/api/jobs/${jobID}/loss`, { params })
@@ -103,7 +101,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
         // remove stale loss keys that no longer exist (rare, but keeps UI clean)
         for (const existingKey of Object.keys(next)) {
-          if (isLossKey(existingKey) && !wantedLossKeys.includes(existingKey)) {
+          if (isGraphableKey(existingKey) && !wantedLossKeys.includes(existingKey)) {
             delete next[existingKey];
             delete lastStepByKeyRef.current[existingKey];
           }

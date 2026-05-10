@@ -79,7 +79,7 @@ export default function JobLossGraph({ job }: Props) {
   const [plotStride, setPlotStride] = useState(1);
 
   // show only last N points in the chart (0 = all)
-  const [windowSize, setWindowSize] = useState<number>(4000);
+  const [windowSize, setWindowSize] = useState<number>(0);
 
   // quick y clipping for readability
   const [clipOutliers, setClipOutliers] = useState(false);
@@ -87,12 +87,13 @@ export default function JobLossGraph({ job }: Props) {
   // which loss series are enabled (default: all enabled)
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
 
-  // keep enabled map in sync with discovered keys (enable new ones automatically)
+  // keep enabled map in sync with discovered keys
+  // loss keys default ON, non-loss keys (e.g. grad_norm) default OFF
   useEffect(() => {
     setEnabled(prev => {
       const next = { ...prev };
       for (const k of lossKeys) {
-        if (next[k] === undefined) next[k] = true;
+        if (next[k] === undefined) next[k] = k === 'loss/loss';
       }
       // drop removed keys
       for (const k of Object.keys(next)) {
@@ -187,25 +188,6 @@ export default function JobLossGraph({ job }: Props) {
     return [lo, hi];
   }, [clipOutliers, chartData, activeKeys, showSmoothed]);
 
-  const latestSummary = useMemo(() => {
-    // Provide a simple “latest” readout for the first active series
-    const firstKey = activeKeys[0];
-    if (!firstKey) return null;
-
-    const s = perSeries[firstKey];
-    if (!s) return null;
-
-    const lastRaw = s.raw.length ? s.raw[s.raw.length - 1] : null;
-    const lastSmooth = s.smooth.length ? s.smooth[s.smooth.length - 1] : null;
-
-    return {
-      key: firstKey,
-      step: lastRaw?.step ?? lastSmooth?.step ?? null,
-      raw: lastRaw?.value ?? null,
-      smooth: lastSmooth?.value ?? null,
-    };
-  }, [activeKeys, perSeries]);
-
   return (
     <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
       <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
@@ -294,6 +276,7 @@ export default function JobLossGraph({ job }: Props) {
                           strokeWidth={1.25}
                           dot={false}
                           isAnimationActive={false}
+                          connectNulls
                         />
                       )}
                       {showSmoothed && (
@@ -305,6 +288,7 @@ export default function JobLossGraph({ job }: Props) {
                           strokeWidth={2}
                           dot={false}
                           isAnimationActive={false}
+                          connectNulls
                         />
                       )}
                     </g>

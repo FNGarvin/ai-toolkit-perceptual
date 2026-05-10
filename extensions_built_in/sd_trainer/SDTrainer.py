@@ -1,9 +1,11 @@
 import os
 import random
+import contextlib
 from collections import OrderedDict
 from typing import Union, Literal, List, Optional
 
 import numpy as np
+from einops import rearrange
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
 
 import torch.functional as F
@@ -37,6 +39,12 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
+from toolkit.config_modules import FaceIDConfig, BodyIDConfig
+from toolkit.face_id import FaceIDProjector, VisionFaceProjector, DifferentiableFaceEncoder, DifferentiableLandmarkEncoder, cache_face_embeddings
+from toolkit.body_id import BodyIDProjector, DifferentiableBodyProportionEncoder, cache_body_embeddings, cache_body_proportion_embeddings
+from toolkit.body_shape import DifferentiableBodyShapeEncoder, cache_body_shape_embeddings
+from toolkit.normal_id import DifferentiableNormalEncoder, cache_normal_embeddings
+from toolkit.vae_anchor import VAEAnchorEncoder, cache_vae_anchor_features
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -104,6 +112,66 @@ class SDTrainer(BaseSDTrainProcess):
             # always do a prior prediction when doing output preservation
             self.do_prior_prediction = True
         
+        # LoRA+ID face conditioning
+        face_id_raw = self.get_conf('face_id', None)
+        if face_id_raw is not None:
+            self.face_id_config = FaceIDConfig(**face_id_raw)
+        else:
+            self.face_id_config = None
+        self.face_id_projector: Optional[FaceIDProjector] = None
+        self.vision_face_projector: Optional[VisionFaceProjector] = None
+        self.id_loss_model: Optional[DifferentiableFaceEncoder] = None
+        self.landmark_loss_model: Optional[DifferentiableLandmarkEncoder] = None
+        self.body_proportion_model: Optional[DifferentiableBodyProportionEncoder] = None
+        self.body_shape_model: Optional[DifferentiableBodyShapeEncoder] = None
+        self.normal_model: Optional[DifferentiableNormalEncoder] = None
+        self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
+        self.vae_anchor_projector = None
+        self._last_identity_loss: Optional[float] = None
+        self._last_landmark_loss: Optional[float] = None
+        self._last_body_proportion_loss: Optional[float] = None
+        self._last_body_proportion_loss_applied: Optional[float] = None
+        self._last_bp_sim_bins: Optional[dict] = None
+        self._last_body_shape_loss: Optional[float] = None
+        self._last_body_shape_loss_applied: Optional[float] = None
+        self._last_body_shape_cos: Optional[float] = None
+        self._last_body_shape_l1: Optional[float] = None
+        self._last_body_shape_gated_pct: Optional[float] = None
+        self._last_bsh_sim_bins: Optional[dict] = None
+        self._last_normal_loss: Optional[float] = None
+        self._last_normal_loss_applied: Optional[float] = None
+        self._last_normal_cos: Optional[float] = None
+        self._last_vae_anchor_loss: Optional[float] = None
+        self._last_vae_anchor_loss_applied: Optional[float] = None
+        self._last_vae_anchor_per_level: Optional[dict] = None
+        self._last_diffusion_loss: Optional[float] = None
+        self._last_diffusion_loss_applied: Optional[float] = None
+        self._last_identity_loss_applied: Optional[float] = None
+        self._last_landmark_loss_applied: Optional[float] = None
+        self._last_timestep: Optional[float] = None
+        self._last_id_sim: Optional[float] = None
+        self._last_id_sim_bins: Optional[dict] = None
+        self._last_id_clean_target: Optional[float] = None
+        self._last_id_shortfall: Optional[float] = None
+        self._last_pure_noise_cos: Optional[float] = None
+        self._id_face_detector = None  # SCRFD detector for x0 quality gating
+        self._last_shape_sim_bins: Optional[dict] = None
+
+        # E-LatentLPIPS perceptual loss
+        self.latent_perceptual_model = None
+        self._latent_perceptual_loss_accumulator: float = 0.0
+        self._latent_perceptual_loss_applied_accumulator: float = 0.0
+        self._latent_perceptual_accumulation_count: int = 0
+        self._lp_preview_cache: Optional[dict] = None
+
+        # Body shape conditioning (SMPL betas)
+        body_id_raw = self.get_conf('body_id', None)
+        if body_id_raw is not None:
+            self.body_id_config = BodyIDConfig(**body_id_raw)
+        else:
+            self.body_id_config = None
+        self.body_id_projector: Optional[BodyIDProjector] = None
+
         # store the loss target for a batch so we can use it in a loss
         self._guidance_loss_target_batch: float = 0.0
         if isinstance(self.train_config.guidance_loss_target, (int, float)):
@@ -242,12 +310,538 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def hook_add_extra_train_params(self, params):
+        params = super().hook_add_extra_train_params(params)
+        if self.face_id_config is not None and self.face_id_config.enabled:
+            hidden_size = self.sd.unet.hidden_size if hasattr(self.sd.unet, 'hidden_size') else 4096
+            self.face_id_projector = FaceIDProjector(
+                id_dim=512,
+                hidden_size=hidden_size,
+                num_tokens=self.face_id_config.num_tokens,
+            ).to(self.device_torch)
+            # Set initial output_scale from config
+            with torch.no_grad():
+                self.face_id_projector.output_scale.fill_(self.face_id_config.init_scale)
+            # Separate param groups: output_scale gets higher LR so it can
+            # ramp up from near-zero without being bottlenecked
+            scale_mult = self.face_id_config.scale_lr_multiplier
+            proj_params = [p for n, p in self.face_id_projector.named_parameters() if n != 'output_scale']
+            scale_params = [self.face_id_projector.output_scale]
+            params.append({
+                'params': proj_params,
+                'lr': self.train_config.lr,
+            })
+            params.append({
+                'params': scale_params,
+                'lr': self.train_config.lr * scale_mult,
+            })
+            total_params = sum(p.numel() for p in self.face_id_projector.parameters())
+            print_acc(f"LoRA+ID: FaceIDProjector added ({total_params} params, output_scale LR={self.train_config.lr * scale_mult:.1e})")
+
+            # Vision face projector (CLIP/DINOv2 spatial tokens → face tokens)
+            if self.face_id_config.vision_enabled:
+                # Detect hidden size from the vision model config
+                from transformers import AutoConfig
+                vision_config = AutoConfig.from_pretrained(self.face_id_config.vision_model)
+                # CLIP returns a parent CLIPConfig — get the vision sub-config
+                if hasattr(vision_config, 'vision_config'):
+                    vision_dim = vision_config.vision_config.hidden_size
+                else:
+                    vision_dim = vision_config.hidden_size
+
+                self.vision_face_projector = VisionFaceProjector(
+                    vision_dim=vision_dim,
+                    hidden_size=hidden_size,
+                    num_tokens=self.face_id_config.vision_num_tokens,
+                ).to(self.device_torch)
+                vp_params = [p for n, p in self.vision_face_projector.named_parameters() if n != 'output_scale']
+                vp_scale = [self.vision_face_projector.output_scale]
+                params.append({
+                    'params': vp_params,
+                    'lr': self.train_config.lr,
+                })
+                params.append({
+                    'params': vp_scale,
+                    'lr': self.train_config.lr * scale_mult,
+                })
+                vp_total = sum(p.numel() for p in self.vision_face_projector.parameters())
+                print_acc(f"LoRA+ID: VisionFaceProjector added ({vp_total} params, vision_dim={vision_dim}, tokens={self.face_id_config.vision_num_tokens})")
+
+        # Body shape projector (SMPL betas → body tokens)
+        if self.body_id_config is not None and self.body_id_config.enabled:
+            hidden_size_body = self.sd.unet.hidden_size if hasattr(self.sd.unet, 'hidden_size') else 4096
+            self.body_id_projector = BodyIDProjector(
+                id_dim=10,
+                hidden_size=hidden_size_body,
+                num_tokens=self.body_id_config.num_tokens,
+            ).to(self.device_torch)
+            with torch.no_grad():
+                self.body_id_projector.output_scale.fill_(self.body_id_config.init_scale)
+            body_scale_mult = self.body_id_config.scale_lr_multiplier
+            bp_params = [p for n, p in self.body_id_projector.named_parameters() if n != 'output_scale']
+            bp_scale = [self.body_id_projector.output_scale]
+            params.append({
+                'params': bp_params,
+                'lr': self.train_config.lr,
+            })
+            params.append({
+                'params': bp_scale,
+                'lr': self.train_config.lr * body_scale_mult,
+            })
+            bp_total = sum(p.numel() for p in self.body_id_projector.parameters())
+            print_acc(f"LoRA+ID: BodyIDProjector added ({bp_total} params, tokens={self.body_id_config.num_tokens}, scale_lr={body_scale_mult}x)")
+
+        return params
+
+    def _get_identity_state_dict(self) -> Optional[OrderedDict]:
+        """Collect projector weights and averaged identity embeddings for saving in LoRA."""
+        extra = OrderedDict()
+
+        # Projector weights (prefixed)
+        if self.face_id_projector is not None:
+            for k, v in self.face_id_projector.state_dict().items():
+                extra[f'face_id_projector.{k}'] = v
+        if self.vision_face_projector is not None:
+            for k, v in self.vision_face_projector.state_dict().items():
+                extra[f'vision_face_projector.{k}'] = v
+        if self.body_id_projector is not None:
+            for k, v in self.body_id_projector.state_dict().items():
+                extra[f'body_id_projector.{k}'] = v
+
+        # Averaged identity embeddings from training data
+        if getattr(self, '_avg_face_embedding', None) is not None:
+            extra['identity.face_embedding'] = self._avg_face_embedding
+        if getattr(self, '_avg_vision_face_embedding', None) is not None:
+            extra['identity.vision_face_embedding'] = self._avg_vision_face_embedding
+        if getattr(self, '_avg_body_embedding', None) is not None:
+            extra['identity.body_embedding'] = self._avg_body_embedding
+
+        return extra if extra else None
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+
+        # Check if face_suppression_weight is active globally or on any dataset
+        _any_face_suppression = False
+        if self.face_id_config is not None:
+            _global_fsw = getattr(self.face_id_config, 'face_suppression_weight', None)
+            if _global_fsw is not None and _global_fsw > 0.0:
+                _any_face_suppression = True
+        if not _any_face_suppression:
+            for dl in [self.data_loader, self.data_loader_reg]:
+                if dl is not None:
+                    for ds in get_dataloader_datasets(dl):
+                        fsw = getattr(ds.dataset_config, 'face_suppression_weight', None)
+                        if fsw is not None and fsw > 0.0:
+                            _any_face_suppression = True
+                            break
+
+        # Scan all datasets for per-dataset loss weight overrides that might enable
+        # models/caching even when the global weight is 0
+        def _any_dataset_overrides(field_name):
+            for dl in [self.data_loader, self.data_loader_reg]:
+                if dl is not None:
+                    for ds in get_dataloader_datasets(dl):
+                        val = getattr(ds.dataset_config, field_name, None)
+                        if val is not None and val > 0:
+                            return True
+            return False
+
+        _ds_identity = _any_dataset_overrides('identity_loss_weight')
+        _ds_landmark = _any_dataset_overrides('landmark_loss_weight')
+        _ds_body_prop = _any_dataset_overrides('body_proportion_loss_weight')
+        _ds_body_shape = _any_dataset_overrides('body_shape_loss_weight')
+        _ds_normal = _any_dataset_overrides('normal_loss_weight')
+        _ds_vae_anchor = _any_dataset_overrides('vae_anchor_loss_weight')
+        _vae_anchor_enabled = (self.face_id_config is not None
+                               and (self.face_id_config.vae_anchor_loss_weight > 0 or _ds_vae_anchor))
+
+        # LoRA+ID: cache face embeddings for all datasets
+        # Run if face conditioning is enabled OR identity loss is enabled OR landmark loss is enabled OR face suppression is active
+        _any_face = self.face_id_config is not None and (self.face_id_config.enabled or self.face_id_config.identity_loss_weight > 0 or self.face_id_config.landmark_loss_weight > 0 or self.face_id_config.body_proportion_loss_weight > 0 or self.face_id_config.body_shape_loss_weight > 0 or self.face_id_config.normal_loss_weight > 0 or _vae_anchor_enabled or self.face_id_config.identity_metrics or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
+        _any_face = _any_face or _any_face_suppression
+        if _any_face:
+            # If face_suppression_weight needs bboxes but no face_id config exists, create a minimal one
+            _face_cache_config = self.face_id_config
+            if _face_cache_config is None and _any_face_suppression:
+                _face_cache_config = FaceIDConfig()
+            print_acc("LoRA+ID: Extracting and caching face embeddings...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_face_embeddings(dataset.file_list, _face_cache_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_face_embeddings(dataset.file_list, _face_cache_config)
+
+        # Compute per-dataset average identity embeddings
+        self._identity_mean_embed = None  # (512,) ArcFace bias direction, set after model load
+
+        self._identity_avg_embeds = {}  # dataset key -> (512,) unit-normalized average
+        self._identity_original_embeds = {}  # dataset key -> [(file_item, original_embed)] for clean_cos computation
+        _need_avg = (_any_face and self.face_id_config is not None and
+                     (self.face_id_config.identity_loss_use_average or self.face_id_config.identity_loss_average_blend > 0))
+        if _need_avg:
+            for dl in [self.data_loader, self.data_loader_reg]:
+                if dl is None:
+                    continue
+                for dataset in get_dataloader_datasets(dl):
+                    valid_embeds = []
+                    for fi in dataset.file_list:
+                        emb = getattr(fi, 'identity_embedding', None)
+                        if emb is not None and emb.abs().sum() > 0:
+                            valid_embeds.append(emb)
+                    if valid_embeds:
+                        avg_embed = torch.stack(valid_embeds).mean(dim=0)
+                        avg_embed = avg_embed / (avg_embed.norm() + 1e-8)
+                        key = dataset.dataset_config.folder_path or id(dataset)
+                        self._identity_avg_embeds[key] = avg_embed
+                        cos_spread = torch.stack(valid_embeds).std(dim=0).mean()
+                        if self.face_id_config.identity_loss_use_average:
+                            # Store originals before replacement (for clean_cos targets)
+                            original_pairs = []
+                            for fi in dataset.file_list:
+                                emb = getattr(fi, 'identity_embedding', None)
+                                if emb is not None and emb.abs().sum() > 0:
+                                    original_pairs.append((fi, emb.clone()))
+                            self._identity_original_embeds[key] = original_pairs
+                            # Pure average: replace per-image embeddings (only where face was detected)
+                            for fi in dataset.file_list:
+                                emb = getattr(fi, 'identity_embedding', None)
+                                if emb is not None and emb.abs().sum() > 0:
+                                    fi.identity_embedding = avg_embed.clone()
+                            print_acc(f"  identity_loss_use_average: replaced {len(valid_embeds)} embeddings with dataset mean (cos_spread={cos_spread:.4f})")
+                        else:
+                            print_acc(f"  identity_loss_average_blend={self.face_id_config.identity_loss_average_blend}: {len(valid_embeds)} embeddings, cos_spread={cos_spread:.4f}")
+
+        # Build per-dataset embedding pools for random / multi-ref modes
+        self._identity_embed_pools = {}  # dataset folder_path -> stacked (N, 512) tensor
+        _need_pools = (self.face_id_config is not None and
+                       (self.face_id_config.identity_loss_use_random or self.face_id_config.identity_loss_num_refs > 0))
+        if _any_face and _need_pools:
+            for dl in [self.data_loader, self.data_loader_reg]:
+                if dl is None:
+                    continue
+                for dataset in get_dataloader_datasets(dl):
+                    valid_embeds = []
+                    for fi in dataset.file_list:
+                        emb = getattr(fi, 'identity_embedding', None)
+                        if emb is not None and emb.abs().sum() > 0:
+                            valid_embeds.append(emb)
+                    if valid_embeds:
+                        pool = torch.stack(valid_embeds)  # (N, 512)
+                        key = dataset.dataset_config.folder_path or id(dataset)
+                        self._identity_embed_pools[key] = pool
+                        print_acc(f"  identity embedding pool: {len(valid_embeds)} embeddings for {key}")
+
+        # Body proportions: cache ViTPose bone-length ratios for all datasets
+        if self.face_id_config is not None and (self.face_id_config.body_proportion_loss_weight > 0 or _ds_body_prop):
+            print_acc("LoRA+ID: Extracting and caching body proportion embeddings...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_body_proportion_embeddings(dataset.file_list, self.face_id_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_body_proportion_embeddings(dataset.file_list, self.face_id_config)
+
+        # Body shape (HybrIK): cache SMPL betas for body shape loss
+        if self.face_id_config is not None and (self.face_id_config.body_shape_loss_weight > 0 or _ds_body_shape):
+            print_acc("LoRA+ID: Extracting and caching body shape embeddings (HybrIK)...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_body_shape_embeddings(dataset.file_list, self.face_id_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_body_shape_embeddings(dataset.file_list, self.face_id_config)
+
+        # Normal maps (Sapiens): cache surface normals for normal loss
+        if self.face_id_config is not None and (self.face_id_config.normal_loss_weight > 0 or _ds_normal):
+            print_acc("LoRA+ID: Extracting and caching normal maps (Sapiens)...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_normal_embeddings(dataset.file_list, self.face_id_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_normal_embeddings(dataset.file_list, self.face_id_config)
+
+        # VAE anchor features: cache multi-scale VAE encoder features for perceptual anchor loss
+        if _vae_anchor_enabled:
+            print_acc("LoRA+ID: Extracting and caching VAE anchor features...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_vae_anchor_features(dataset.file_list, self.face_id_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_vae_anchor_features(dataset.file_list, self.face_id_config)
+
+        # Body shape (conditioning): cache SMPL betas for all datasets
+        if self.body_id_config is not None and self.body_id_config.enabled:
+            print_acc("LoRA+ID: Extracting and caching body shape embeddings...")
+            if self.data_loader is not None:
+                datasets = get_dataloader_datasets(self.data_loader)
+                for dataset in datasets:
+                    cache_body_embeddings(dataset.file_list, self.body_id_config)
+            if self.data_loader_reg is not None:
+                datasets = get_dataloader_datasets(self.data_loader_reg)
+                for dataset in datasets:
+                    cache_body_embeddings(dataset.file_list, self.body_id_config)
+
+        # Compute averaged identity embeddings for saving in LoRA
+        self._avg_face_embedding = None
+        self._avg_vision_face_embedding = None
+        self._avg_body_embedding = None
+        if self.data_loader is not None:
+            all_datasets = get_dataloader_datasets(self.data_loader)
+            all_files = [fi for ds in all_datasets for fi in ds.file_list]
+
+            face_embs = [fi.face_embedding for fi in all_files if getattr(fi, 'face_embedding', None) is not None]
+            if face_embs:
+                # Filter out zero vectors (no face detected)
+                nonzero = [e for e in face_embs if e.abs().sum() > 0]
+                if nonzero:
+                    self._avg_face_embedding = F.normalize(torch.stack(nonzero).mean(dim=0), dim=-1)
+
+            vision_embs = [fi.vision_face_embedding for fi in all_files if getattr(fi, 'vision_face_embedding', None) is not None]
+            if vision_embs:
+                nonzero = [e for e in vision_embs if e.abs().sum() > 0]
+                if nonzero:
+                    self._avg_vision_face_embedding = torch.stack(nonzero).mean(dim=0)
+
+            body_embs = [fi.body_embedding for fi in all_files if getattr(fi, 'body_embedding', None) is not None]
+            if body_embs:
+                nonzero = [e for e in body_embs if e.abs().sum() > 0]
+                if nonzero:
+                    self._avg_body_embedding = torch.stack(nonzero).mean(dim=0)
+
+        # Determine if any face loss needs a latent decoder (TAESD)
+        _need_face_decoder = (
+            self.face_id_config is not None
+            and (self.face_id_config.identity_loss_weight > 0
+                 or self.face_id_config.landmark_loss_weight > 0
+                 or self.face_id_config.body_proportion_loss_weight > 0
+                 or self.face_id_config.body_shape_loss_weight > 0
+                 or self.face_id_config.normal_loss_weight > 0
+                 or _vae_anchor_enabled
+                 or self.face_id_config.identity_metrics
+                 or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
+        )
+
+        # Load identity loss model (ArcFace + TAESD) if enabled
+        # Works with or without face token conditioning (face_id.enabled)
+        if (self.face_id_config is not None
+                and (self.face_id_config.identity_loss_weight > 0 or self.face_id_config.identity_metrics or _ds_identity)):
+            print_acc("LoRA+ID: Loading identity loss model (ArcFace)...")
+            self.id_loss_model = DifferentiableFaceEncoder()
+            self.id_loss_model.to(self.device_torch)
+
+            # Compute ArcFace bias direction for cos_sim correction.
+            # ArcFace maps all non-face inputs to a tight cluster (~0.5 cos_sim
+            # vs faces). Subtracting this bias direction makes non-face inputs
+            # score ~0 while preserving face identity discrimination.
+            print_acc("  Computing ArcFace bias direction from noise...")
+            with torch.no_grad():
+                noise_embeds = []
+                for _ in range(200):
+                    noise_img = torch.randn(1, 3, 112, 112, device=self.device_torch) * 0.3 + 0.5
+                    noise_img = noise_img.clamp(0, 1)
+                    emb = self.id_loss_model(noise_img)
+                    noise_embeds.append(emb)
+                noise_embeds = torch.cat(noise_embeds, dim=0)
+                self._identity_mean_embed = noise_embeds.mean(dim=0).cpu()
+            print_acc(f"  ArcFace bias correction: noise mean norm={self._identity_mean_embed.norm():.4f}")
+
+            # Load lightweight face detector to gate identity loss on x0 predictions.
+            # Blobs that ArcFace scores ~0.4 against faces should be filtered out
+            # BEFORE cosine similarity — if no face is detected in the crop, skip it.
+            print_acc("  Loading SCRFD face detector for x0 quality gate...")
+            from insightface.app import FaceAnalysis
+            self._id_face_detector = FaceAnalysis(
+                name='buffalo_l', allowed_modules=['detection'],
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            )
+            self._id_face_detector.prepare(ctx_id=0, det_size=(160, 160))
+            print_acc("  SCRFD face detector loaded")
+
+            # Compute per-image clean_cos targets for average mode.
+            # Each image's clean ArcFace similarity to the dataset average becomes
+            # its loss target — a profile shot scoring 0.7 won't be pushed beyond 0.7.
+            if self._identity_original_embeds:
+                mean_emb = self._identity_mean_embed
+                for key, pairs in self._identity_original_embeds.items():
+                    avg = self._identity_avg_embeds[key]
+                    avg_c = F.normalize(avg - mean_emb, p=2, dim=-1)
+                    clean_vals = []
+                    for fi, orig_emb in pairs:
+                        orig_c = F.normalize(orig_emb - mean_emb, p=2, dim=-1)
+                        clean_cos = F.cosine_similarity(orig_c.unsqueeze(0), avg_c.unsqueeze(0), dim=-1).item()
+                        fi.identity_clean_cos = max(clean_cos, 0.1)  # clamp floor to prevent div instability
+                        clean_vals.append(fi.identity_clean_cos)
+                    import numpy as _np
+                    print_acc(f"  Clean cos targets for {key}: "
+                              f"min={min(clean_vals):.3f} max={max(clean_vals):.3f} "
+                              f"mean={_np.mean(clean_vals):.3f} std={_np.std(clean_vals):.3f}")
+                del self._identity_original_embeds  # free memory
+
+        # Load landmark loss model (MediaPipe FaceMesh) if enabled
+        if (self.face_id_config is not None
+                and (self.face_id_config.landmark_loss_weight > 0 or _ds_landmark)):
+            print_acc("LoRA+ID: Loading landmark loss model (MediaPipe FaceMesh)...")
+            self.landmark_loss_model = DifferentiableLandmarkEncoder()
+            self.landmark_loss_model.to(self.device_torch)
+
+        # Load body proportion loss model (ViTPose) if enabled
+        if (self.face_id_config is not None
+                and (self.face_id_config.body_proportion_loss_weight > 0 or _ds_body_prop)):
+            print_acc("LoRA+ID: Loading body proportion loss model (ViTPose)...")
+            self.body_proportion_model = DifferentiableBodyProportionEncoder()
+            self.body_proportion_model.to(self.device_torch)
+
+        # Load body shape loss model (HybrIK) if enabled
+        if (self.face_id_config is not None
+                and (self.face_id_config.body_shape_loss_weight > 0 or _ds_body_shape)):
+            print_acc("LoRA+ID: Loading body shape loss model (HybrIK)...")
+            self.body_shape_model = DifferentiableBodyShapeEncoder()
+            self.body_shape_model.to(self.device_torch)
+
+        # Load normal loss model (Sapiens) if enabled
+        if (self.face_id_config is not None
+                and (self.face_id_config.normal_loss_weight > 0 or _ds_normal)):
+            print_acc("LoRA+ID: Loading normal loss model (Sapiens 0.3B)...")
+            self.normal_model = DifferentiableNormalEncoder()
+            self.normal_model.to(self.device_torch)
+
+        # Load E-LatentLPIPS model if latent perceptual loss is enabled
+        if self.train_config.latent_perceptual_loss_weight > 0:
+            from elatentlpips import ELatentLPIPS
+            encoder = self.train_config.latent_perceptual_encoder
+            # Auto-detect encoder from model architecture if set to 'auto'
+            if encoder == 'auto':
+                arch = self.sd.model_config.arch if hasattr(self.sd, 'model_config') else None
+                if arch in ('sdxl', 'sd1', 'sd2', 'ssd'):
+                    encoder = 'sdxl' if arch == 'sdxl' else 'sd15'
+                elif arch in ('sd3',):
+                    encoder = 'sd3'
+                elif arch in ('flux', 'flex1', 'flex2'):
+                    encoder = 'flux'
+                else:
+                    encoder = 'sdxl'  # safe default (4ch)
+                print_acc(f"  Auto-detected E-LatentLPIPS encoder: {encoder} (arch={arch})")
+            print_acc(f"Loading E-LatentLPIPS model (encoder={encoder}) for latent perceptual loss")
+            self.latent_perceptual_model = ELatentLPIPS(
+                pretrained=True, encoder=encoder, verbose=True, augment=None,
+            )
+            self.latent_perceptual_model.eval()
+            self.latent_perceptual_model.requires_grad_(False)
+            self.latent_perceptual_model.to(self.device_torch)
+            num_params = sum(p.numel() for p in self.latent_perceptual_model.parameters())
+            print_acc(f"E-LatentLPIPS loaded: {num_params:,} parameters on {self.device_torch}")
+
+        # Load VAE anchor encoder if enabled
+        if _vae_anchor_enabled:
+            self.vae_anchor_encoder = VAEAnchorEncoder(
+                vae_path=self.face_id_config.vae_anchor_model_path
+            )
+            self.vae_anchor_encoder.load(
+                device=self.device_torch, dtype=torch.float32
+            )
+            print_acc("  VAE anchor encoder loaded")
+
+            # Enable fine-grained gradient checkpointing on SDXL VAE decoder.
+            # The diffusers built-in only checkpoints per UpDecoderBlock (4 segments).
+            # We patch to checkpoint each ResNet + upsampler individually (~15 segments),
+            # reducing decode activations from ~6.7GB to ~2.8GB at 768x768.
+            if self.sd.vae is not None and hasattr(self.sd.vae, 'decoder'):
+                _decoder = self.sd.vae.decoder
+                def _fine_ckpt_forward(sample, latent_embeds=None):
+                    from torch.utils.checkpoint import checkpoint as ckpt
+                    sample = _decoder.conv_in(sample)
+                    upscale_dtype = next(iter(_decoder.up_blocks.parameters())).dtype
+                    sample = ckpt(_decoder.mid_block, sample, latent_embeds, use_reentrant=False)
+                    sample = sample.to(upscale_dtype)
+                    for up_block in _decoder.up_blocks:
+                        for resnet in up_block.resnets:
+                            sample = ckpt(resnet, sample, None, use_reentrant=False)
+                        if up_block.upsamplers is not None:
+                            for upsampler in up_block.upsamplers:
+                                sample = ckpt(upsampler, sample, use_reentrant=False)
+                    if latent_embeds is None:
+                        sample = _decoder.conv_norm_out(sample)
+                    else:
+                        sample = _decoder.conv_norm_out(sample, latent_embeds)
+                    sample = _decoder.conv_act(sample)
+                    sample = _decoder.conv_out(sample)
+                    return sample
+
+                _decoder.forward = _fine_ckpt_forward
+                print_acc("  VAE decoder: fine-grained gradient checkpointing enabled")
+
+        # Load lightweight decoder for face losses (identity)
+        if _need_face_decoder and self.taesd is None:
+            if hasattr(self.sd.vae, 'config') and self.sd.vae.config is not None:
+                vae_channels = self.sd.vae.config.get('latent_channels', 4)
+            elif hasattr(self.sd.vae, 'params'):
+                vae_channels = getattr(self.sd.vae.params, 'z_channels', 4)
+            else:
+                vae_channels = 4
+            if vae_channels == 32:
+                # Flux 2 VAE (32-ch latents packed to 128-ch) — use TAEF2
+                from toolkit.taesd import Decoder as TAESDDecoder
+                from huggingface_hub import hf_hub_download
+                from safetensors.torch import load_file as load_sf
+                print_acc("  Loading TAEF2 decoder for face losses...")
+                weights_path = hf_hub_download("madebyollin/taef2", "taef2.safetensors")
+                sd = load_sf(weights_path)
+                # extract decoder weights: remap "decoder.layers.N" -> "N+1" (Clamp at idx 0 has no params)
+                decoder_sd = {}
+                for k, v in sd.items():
+                    if k.startswith("decoder.layers."):
+                        rest = k.replace("decoder.layers.", "")
+                        parts = rest.split(".", 1)
+                        idx = int(parts[0]) + 1
+                        remainder = "." + parts[1] if len(parts) > 1 else ""
+                        decoder_sd[str(idx) + remainder] = v
+                decoder = TAESDDecoder(latent_channels=32, use_midblock_gn=True)
+                decoder.load_state_dict(decoder_sd)
+                decoder.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
+                decoder.eval()
+                decoder.requires_grad_(False)
+                self._taef2_decoder = decoder
+            elif self.sd.is_flux or 'flex' in getattr(self.sd, 'arch', ''):
+                taesd_name = "madebyollin/taef1"
+                print_acc(f"  Loading TAESD ({taesd_name}) for face losses...")
+                self.taesd = AutoencoderTiny.from_pretrained(
+                    taesd_name, torch_dtype=get_torch_dtype(self.train_config.dtype))
+                self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
+                self.taesd.eval()
+                self.taesd.requires_grad_(False)
+            elif self.model_config.is_xl:
+                print_acc("  Loading TAESD (madebyollin/taesdxl) for face losses...")
+                self.taesd = AutoencoderTiny.from_pretrained(
+                    "madebyollin/taesdxl", torch_dtype=get_torch_dtype(self.train_config.dtype))
+                self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
+                self.taesd.eval()
+                self.taesd.requires_grad_(False)
+            else:
+                print_acc("  Loading TAESD (madebyollin/taesd) for face losses...")
+                self.taesd = AutoencoderTiny.from_pretrained(
+                    "madebyollin/taesd", torch_dtype=get_torch_dtype(self.train_config.dtype))
+                self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
+                self.taesd.eval()
+                self.taesd.requires_grad_(False)
+
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
-        
+
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
             kwargs = {}
@@ -484,6 +1078,11 @@ class SDTrainer(BaseSDTrainProcess):
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0
 
+        # log timestep ratio for distribution visualization
+        with torch.no_grad():
+            num_train_ts = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            self._last_timestep = (timesteps.float() / num_train_ts).mean().item()
+
         prior_mask_multiplier = None
         target_mask_multiplier = None
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -654,7 +1253,7 @@ class SDTrainer(BaseSDTrainProcess):
                     dfe_loss += torch.nn.functional.mse_loss(pred_feature_list[i], target_feature_list[i], reduction="mean")
                 
                 additional_loss += dfe_loss * self.train_config.diffusion_feature_extractor_weight * 100.0
-            elif self.dfe.version in [3, 4, 5]:
+            elif self.dfe.version in [3, 4, 5, 6]:
                 dfe_loss = self.dfe(
                     noise=noise,
                     noise_pred=noise_pred,
@@ -843,6 +1442,7 @@ class SDTrainer(BaseSDTrainProcess):
         except:
             # todo handle mask with video models
             pass
+
         if prior_loss is not None:
             loss = loss + prior_loss
 
@@ -858,8 +1458,35 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
-        loss = loss.mean()
-        
+        # snapshot raw diffusion loss before timestep gating (for logging)
+        with torch.no_grad():
+            raw_diffusion_loss = loss.mean().detach()
+
+        # apply diffusion loss timestep gating (per-sample, before .mean())
+        if self.train_config.diffusion_loss_min_t > 0.0 or self.train_config.diffusion_loss_max_t < 1.0:
+            t_ratio = timesteps.float() / num_train_ts
+            diff_mask = ((t_ratio >= self.train_config.diffusion_loss_min_t) &
+                         (t_ratio <= self.train_config.diffusion_loss_max_t)).float()
+            loss = loss * diff_mask
+
+        # apply per-sample diffusion loss weight overrides
+        per_sample_diff_w = batch.diffusion_loss_weight_list
+        if any(w is not None for w in per_sample_diff_w):
+            global_diff_w = self.train_config.diffusion_loss_weight
+            diff_weights = torch.tensor(
+                [w if w is not None else global_diff_w for w in per_sample_diff_w],
+                device=loss.device, dtype=loss.dtype
+            )
+            # Exclude zero-weight samples from denominator to prevent dilution
+            active_count = (diff_weights > 0).sum().clamp(min=1)
+            loss = (loss * diff_weights).sum() / active_count
+        else:
+            loss = loss.mean()
+            # scale diffusion loss
+            if self.train_config.diffusion_loss_weight != 1.0:
+                loss = loss * self.train_config.diffusion_loss_weight
+        self._last_diffusion_loss_applied = loss.detach().item()
+
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
@@ -878,8 +1505,1157 @@ class SDTrainer(BaseSDTrainProcess):
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
             loss = loss + norm_std_loss
 
+        # snapshot diffusion loss before identity loss is added
+        # uses raw (un-gated) loss so the metric shows what diffusion loss
+        # would have been even when timestep-gated off
+        self._last_diffusion_loss = raw_diffusion_loss.item()
+
+        # Auxiliary face losses (identity, landmark) via decoded x0 predictions
+        # Evaluated at HIGH noise where x0_pred is a genuine generation.
+        _need_id_loss = (self.id_loss_model is not None
+                         and batch.identity_embedding is not None)
+        _need_landmark_loss = (self.landmark_loss_model is not None
+                               and batch.landmark_embedding is not None)
+        _need_body_proportion_loss = (self.body_proportion_model is not None
+                                      and batch.body_proportion_embedding is not None)
+        _need_body_shape_loss = (self.body_shape_model is not None
+                                 and batch.body_shape_embedding is not None)
+        _need_normal_loss = (self.normal_model is not None
+                             and batch.normal_embedding is not None)
+        _need_vae_anchor_loss = (self.vae_anchor_encoder is not None
+                                 and batch.vae_anchor_features is not None)
+
+        if _need_id_loss or _need_landmark_loss or _need_body_proportion_loss or _need_body_shape_loss or _need_normal_loss or _need_vae_anchor_loss:
+            num_train_timesteps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+            t_ratio = timesteps.float() / num_train_timesteps
+
+            # Build per-sample timestep masks (per-dataset overrides fall back to global)
+            def _per_sample_mask(batch_min_list, batch_max_list, global_min, global_max):
+                """Build (B,) bool mask using per-sample min/max_t with global fallback."""
+                min_vals = torch.tensor(
+                    [v if v is not None else global_min for v in batch_min_list],
+                    device=t_ratio.device, dtype=t_ratio.dtype,
+                )
+                max_vals = torch.tensor(
+                    [v if v is not None else global_max for v in batch_max_list],
+                    device=t_ratio.device, dtype=t_ratio.dtype,
+                )
+                return (t_ratio > min_vals) & (t_ratio < max_vals)
+
+            # Face losses (identity + landmark) use their own timestep window
+            high_noise_mask = _per_sample_mask(
+                batch.identity_loss_min_t_list, batch.identity_loss_max_t_list,
+                self.face_id_config.identity_loss_min_t, self.face_id_config.identity_loss_max_t,
+            )
+
+            # Body proportion loss has its own timestep window
+            bp_noise_mask = _per_sample_mask(
+                batch.body_proportion_loss_min_t_list, batch.body_proportion_loss_max_t_list,
+                self.face_id_config.body_proportion_loss_min_t, self.face_id_config.body_proportion_loss_max_t,
+            )
+
+            # Body shape loss has its own timestep window
+            bsh_noise_mask = _per_sample_mask(
+                batch.body_shape_loss_min_t_list, batch.body_shape_loss_max_t_list,
+                self.face_id_config.body_shape_loss_min_t, self.face_id_config.body_shape_loss_max_t,
+            )
+
+            # Normal loss has its own timestep window
+            nrm_noise_mask = _per_sample_mask(
+                batch.normal_loss_min_t_list, batch.normal_loss_max_t_list,
+                self.face_id_config.normal_loss_min_t, self.face_id_config.normal_loss_max_t,
+            )
+
+            # VAE anchor loss has its own timestep window
+            va_noise_mask = _per_sample_mask(
+                batch.vae_anchor_loss_min_t_list, batch.vae_anchor_loss_max_t_list,
+                self.face_id_config.vae_anchor_loss_min_t, self.face_id_config.vae_anchor_loss_max_t,
+            )
+
+            cos_sim = None  # set by identity loss, reused by landmark loss for gating
+
+            # identity_metrics: always decode x0 so we can track similarity at all timesteps
+            _id_metrics_always = (self.face_id_config is not None
+                                  and self.face_id_config.identity_metrics
+                                  and _need_id_loss)
+
+            # Decode x0 if any loss needs it
+            any_active = (high_noise_mask.any()
+                          or (_need_body_proportion_loss and bp_noise_mask.any())
+                          or (_need_body_shape_loss and bsh_noise_mask.any())
+                          or (_need_normal_loss and nrm_noise_mask.any())
+                          or (_need_vae_anchor_loss and va_noise_mask.any())
+                          or _id_metrics_always)
+            if any_active:
+                # Recover x0 prediction from model output
+                if self.sd.is_flow_matching:
+                    # Flow matching: x0 = noisy_latents - sigma * v_pred
+                    sigma = t_ratio.view(-1, 1, 1, 1)
+                    x0_pred = noisy_latents - sigma * noise_pred
+                else:
+                    # DDPM: recover x0 from epsilon or v prediction
+                    alphas_cumprod = self.sd.noise_scheduler.alphas_cumprod.to(
+                        device=timesteps.device, dtype=noisy_latents.dtype
+                    )
+                    alpha_bar = alphas_cumprod[timesteps.long()].view(-1, 1, 1, 1)
+                    sqrt_alpha_bar = alpha_bar.sqrt()
+                    sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+                    if self.sd.prediction_type == 'v_prediction':
+                        x0_pred = sqrt_alpha_bar * noisy_latents - sqrt_one_minus_alpha_bar * noise_pred
+                    else:
+                        # epsilon prediction
+                        x0_pred = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
+
+                # Decode x0 prediction to pixel space for face recognition
+                if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                    x0_for_decode = x0_pred
+                    if x0_for_decode.shape[1] != 32:
+                        x0_for_decode = rearrange(
+                            x0_for_decode,
+                            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+                            c=32, p1=2, p2=2,
+                        )
+                    dec_dtype = next(self._taef2_decoder.parameters()).dtype
+                    x0_pixels = self._taef2_decoder(x0_for_decode.to(dec_dtype)).float().clamp(0, 1)
+                elif self.taesd is not None:
+                    taesd_dtype = next(self.taesd.parameters()).dtype
+                    x0_pixels = self.taesd.decode(x0_pred.to(taesd_dtype)).sample.float()
+                    x0_pixels = (x0_pixels + 1.0) * 0.5  # [-1,1] -> [0,1]
+                else:
+                    vae_dtype = self.sd.vae.dtype
+                    x0_unscaled = x0_pred / self.sd.vae.config['scaling_factor']
+                    if 'shift_factor' in self.sd.vae.config and self.sd.vae.config['shift_factor']:
+                        x0_unscaled = x0_unscaled + self.sd.vae.config['shift_factor']
+                    x0_decoded = self.sd.vae.decode(x0_unscaled.to(vae_dtype)).sample
+                    x0_pixels = (x0_decoded.float() + 1.0) * 0.5  # [-1,1] -> [0,1]
+                x0_pixels = x0_pixels.clamp(0, 1)
+
+                # Scale face bboxes from original image coords to x0_pixels coords
+                # Pipeline: orig -> scale -> crop -> latent -> decode to x0_pixels
+                scaled_bboxes = None
+                if batch.face_bboxes is not None:
+                    _, _, px_h, px_w = x0_pixels.shape
+                    scaled_bboxes = []
+                    for idx in range(x0_pixels.shape[0]):
+                        raw_bbox = batch.face_bboxes[idx] if idx < len(batch.face_bboxes) else None
+                        if raw_bbox is not None:
+                            fi = batch.file_items[idx]
+                            orig_w = float(fi.width)
+                            orig_h = float(fi.height)
+                            bx1, by1, bx2, by2 = raw_bbox.float()
+
+                            stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
+                            sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
+                            bx1 = bx1 * (stw / orig_w)
+                            by1 = by1 * (sth / orig_h)
+                            bx2 = bx2 * (stw / orig_w)
+                            by2 = by2 * (sth / orig_h)
+
+                            cx = float(getattr(fi, 'crop_x', None) or 0)
+                            cy = float(getattr(fi, 'crop_y', None) or 0)
+                            cw = float(getattr(fi, 'crop_width', None) or stw)
+                            ch = float(getattr(fi, 'crop_height', None) or sth)
+                            bx1 = bx1 - cx
+                            by1 = by1 - cy
+                            bx2 = bx2 - cx
+                            by2 = by2 - cy
+
+                            if bx2 <= 0 or by2 <= 0 or bx1 >= cw or by1 >= ch:
+                                scaled_bboxes.append(None)
+                                continue
+
+                            bx1 = bx1 * (px_w / cw)
+                            by1 = by1 * (px_h / ch)
+                            bx2 = bx2 * (px_w / cw)
+                            by2 = by2 * (px_h / ch)
+
+                            bx1 = max(0.0, min(bx1, float(px_w)))
+                            by1 = max(0.0, min(by1, float(px_h)))
+                            bx2 = max(0.0, min(bx2, float(px_w)))
+                            by2 = max(0.0, min(by2, float(px_h)))
+
+                            scaled_bboxes.append([bx1, by1, bx2, by2])
+                        else:
+                            scaled_bboxes.append(None)
+
+                # --- Identity loss (ArcFace cosine similarity) ---
+                if _need_id_loss:
+                    _has_per_sample_id_w = any(w is not None and w > 0 for w in batch.identity_loss_weight_list)
+                    _id_metrics_only = self.face_id_config.identity_loss_weight == 0 and not _has_per_sample_id_w
+                    _id_ctx = torch.no_grad() if _id_metrics_only else contextlib.nullcontext()
+                    with _id_ctx:
+                        id_weight = t_ratio
+                        gen_embedding, _arcface_crops = self.id_loss_model(
+                            x0_pixels, bboxes=scaled_bboxes, return_crops=True)  # (B, 512), (B, 3, 112, 112)
+
+                        # Gate: run face detector on x0 crops — skip blobs that
+                        # ArcFace would score ~0.4 against faces.  ~1.5ms per crop.
+                        _face_detected = torch.ones(gen_embedding.shape[0], dtype=torch.bool,
+                                                     device=gen_embedding.device)
+                        if self._id_face_detector is not None and _arcface_crops is not None:
+                            with torch.no_grad():
+                                for _ci in range(_arcface_crops.shape[0]):
+                                    crop_np = (_arcface_crops[_ci].clamp(0, 1) * 255).byte()
+                                    crop_np = crop_np.permute(1, 2, 0).cpu().numpy()  # (112,112,3) RGB
+                                    crop_bgr = crop_np[:, :, ::-1].copy()  # BGR for insightface
+                                    faces = self._id_face_detector.get(crop_bgr)
+                                    if len(faces) == 0:
+                                        _face_detected[_ci] = False
+
+                        ref_embedding = batch.identity_embedding.to(
+                            gen_embedding.device, dtype=gen_embedding.dtype)
+
+                        # Blend mode: interpolate between per-image and dataset average
+                        _blend = self.face_id_config.identity_loss_average_blend
+                        if _blend > 0 and not self.face_id_config.identity_loss_use_average and self._identity_avg_embeds:
+                            for idx in range(ref_embedding.shape[0]):
+                                fi = batch.file_items[idx]
+                                key = fi.dataset_config.folder_path or id(fi.dataset_config)
+                                avg = self._identity_avg_embeds.get(key)
+                                if avg is not None:
+                                    avg_dev = avg.to(ref_embedding.device, dtype=ref_embedding.dtype)
+                                    blended = (1.0 - _blend) * ref_embedding[idx] + _blend * avg_dev
+                                    ref_embedding[idx] = blended / (blended.norm() + 1e-8)
+
+                        # Random mode: replace ref with random embedding from same dataset's pool
+                        if self.face_id_config.identity_loss_use_random and self._identity_embed_pools:
+                            import random as _rand
+                            for idx in range(ref_embedding.shape[0]):
+                                fi = batch.file_items[idx]
+                                key = fi.dataset_config.folder_path or id(fi.dataset_config)
+                                pool = self._identity_embed_pools.get(key)
+                                if pool is not None:
+                                    rand_idx = _rand.randint(0, pool.shape[0] - 1)
+                                    ref_embedding[idx] = pool[rand_idx].to(ref_embedding.device, dtype=ref_embedding.dtype)
+
+                        # ArcFace bias correction: subtract mean embedding direction
+                        # so non-face inputs score ~0 instead of ~0.5
+                        if self._identity_mean_embed is not None:
+                            mean_emb = self._identity_mean_embed.to(gen_embedding.device, dtype=gen_embedding.dtype)
+                            gen_centered = gen_embedding - mean_emb.unsqueeze(0)
+                            gen_centered = F.normalize(gen_centered, p=2, dim=-1)
+                            ref_centered = ref_embedding - mean_emb.unsqueeze(0)
+                            ref_centered = F.normalize(ref_centered, p=2, dim=-1)
+                        else:
+                            gen_centered = gen_embedding
+                            ref_centered = ref_embedding
+
+                        # Multi-ref mode: compare against K random refs, use best match
+                        _num_refs = self.face_id_config.identity_loss_num_refs
+                        if _num_refs > 0 and self._identity_embed_pools:
+                            import random as _rand
+                            all_cos = [F.cosine_similarity(gen_centered, ref_centered, dim=-1)]
+                            for _ in range(_num_refs - 1):
+                                rand_ref = ref_centered.clone()
+                                for idx in range(rand_ref.shape[0]):
+                                    fi = batch.file_items[idx]
+                                    key = fi.dataset_config.folder_path or id(fi.dataset_config)
+                                    pool = self._identity_embed_pools.get(key)
+                                    if pool is not None:
+                                        rand_idx = _rand.randint(0, pool.shape[0] - 1)
+                                        rand_emb = pool[rand_idx].to(rand_ref.device, dtype=rand_ref.dtype)
+                                        if self._identity_mean_embed is not None:
+                                            rand_emb = F.normalize(rand_emb - mean_emb, p=2, dim=-1)
+                                        rand_ref[idx] = rand_emb
+                                all_cos.append(F.cosine_similarity(gen_centered, rand_ref, dim=-1))
+                            cos_sim = torch.stack(all_cos).max(dim=0).values  # (B,) best match
+                        else:
+                            cos_sim = F.cosine_similarity(gen_centered, ref_centered, dim=-1)  # (B,)
+
+                        # Metric mask: valid face, gated by timestep window unless identity_metrics
+                        ref_valid = ref_embedding.abs().sum(dim=-1) > 0
+                        if _id_metrics_always:
+                            metric_mask = ref_valid  # all timesteps for logging
+                        else:
+                            metric_mask = ref_valid & high_noise_mask
+                        # Loss mask: also gate by per-sample cosine threshold to prevent hallucination
+                        cos_threshold = torch.tensor(
+                            [v if v is not None else self.face_id_config.identity_loss_min_cos
+                             for v in batch.identity_loss_min_cos_list],
+                            device=cos_sim.device, dtype=cos_sim.dtype,
+                        )
+                        loss_mask = metric_mask & (cos_sim.detach() > cos_threshold) & _face_detected
+
+                        # Build per-sample identity weights early — gate loss_mask so
+                        # zero-weight samples are fully excluded from loss computation
+                        per_sample_id_w = batch.identity_loss_weight_list
+                        _has_per_ds_id_w = any(w is not None for w in per_sample_id_w)
+                        if _has_per_ds_id_w:
+                            global_id_w = self.face_id_config.identity_loss_weight
+                            id_weights = torch.tensor(
+                                [w if w is not None else global_id_w for w in per_sample_id_w],
+                                device=cos_sim.device, dtype=cos_sim.dtype,
+                            )
+                            loss_mask = loss_mask & (id_weights > 0)
+
+                        # Clean similarity targets: in average mode, each sample's target
+                        # is its clean ArcFace score vs the average, not 1.0.
+                        # Loss = max(0, 1 - cos_sim/clean_cos) — normalized so no sample
+                        # is over-weighted regardless of its absolute target.
+                        _has_clean_targets = (
+                            self.face_id_config.identity_loss_use_average
+                            and any(c is not None for c in batch.identity_clean_cos_list)
+                        )
+                        if _has_clean_targets:
+                            clean_cos = torch.tensor(
+                                [c if c is not None else 1.0 for c in batch.identity_clean_cos_list],
+                                device=cos_sim.device, dtype=cos_sim.dtype,
+                            )
+                            # Normalized shortfall: 0 when at target, 1 when cos_sim=0
+                            id_loss_per_sample = torch.clamp(1.0 - cos_sim / clean_cos, min=0.0) * id_weight * loss_mask.float()
+                        else:
+                            id_loss_per_sample = (1.0 - cos_sim) * id_weight * loss_mask.float()
+                        id_loss = id_loss_per_sample.sum() / max(loss_mask.sum().item(), 1.0)
+
+                    if not _id_metrics_only and loss_mask.any():
+                        if _has_per_ds_id_w:
+                            weighted_id = (id_loss_per_sample * id_weights)
+                            id_applied = weighted_id.sum() / max(loss_mask.sum().item(), 1.0)
+                        else:
+                            id_applied = self.face_id_config.identity_loss_weight * id_loss
+                        loss = loss + id_applied
+                        self._last_identity_loss_applied = id_applied.detach().item()
+                    # Gate metrics by per-sample weights so zero-weight datasets
+                    # don't bleed into identity metrics
+                    valid_mask = metric_mask
+                    if _has_per_ds_id_w:
+                        valid_mask = valid_mask & (id_weights > 0)
+                    with torch.no_grad():
+                        if valid_mask.any():
+                            raw_cos_dist = (1.0 - cos_sim) * valid_mask.float()
+                            raw_count = valid_mask.sum().item()
+                            self._last_identity_loss = (raw_cos_dist.sum() / raw_count).item()
+                            raw_cos_sim = (cos_sim * valid_mask.float()).sum() / raw_count
+                            self._last_id_sim = raw_cos_sim.item()
+                            # Clean target metrics (average mode only)
+                            if _has_clean_targets:
+                                valid_clean = clean_cos * valid_mask.float()
+                                self._last_id_clean_target = (valid_clean.sum() / raw_count).item()
+                                raw_shortfall = torch.clamp(clean_cos - cos_sim, min=0.0) * valid_mask.float()
+                                self._last_id_shortfall = (raw_shortfall.sum() / raw_count).item()
+                            if self._last_id_sim_bins is None:
+                                self._last_id_sim_bins = {}
+                            for idx in range(cos_sim.shape[0]):
+                                if valid_mask[idx]:
+                                    t_val = t_ratio[idx].item()
+                                    bin_start = int(t_val * 10) / 10.0
+                                    bin_key = f'id_sim_t{int(bin_start*100):02d}'
+                                    self._last_id_sim_bins[bin_key] = cos_sim[idx].item()
+                        # save decoded x0 predictions + ArcFace crops to visualize identity pipeline
+                        if valid_mask.any():
+                            id_preview_dir = os.path.join(self.save_root, 'id_previews')
+                            os.makedirs(id_preview_dir, exist_ok=True)
+                            noisy_for_decode = noisy_latents
+                            if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                                nfd = noisy_for_decode
+                                if nfd.shape[1] != 32:
+                                    nfd = rearrange(nfd, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=32, p1=2, p2=2)
+                                noisy_pixels = self._taef2_decoder(nfd.to(dec_dtype)).float().clamp(0, 1)
+                            elif self.taesd is not None:
+                                noisy_pixels = self.taesd.decode(noisy_for_decode.to(taesd_dtype)).sample.float()
+                                noisy_pixels = ((noisy_pixels + 1.0) * 0.5).clamp(0, 1)
+                            else:
+                                noisy_pixels = None
+                            for idx in range(x0_pixels.shape[0]):
+                                if valid_mask[idx]:
+                                    pred_pix = x0_pixels[idx].clamp(0, 1).cpu()
+                                    pred_img = TF.to_pil_image(pred_pix)
+                                    cos_val = cos_sim[idx].item()
+                                    t_val = t_ratio[idx].item()
+                                    src_name = os.path.splitext(os.path.basename(batch.file_items[idx].path))[0] if idx < len(batch.file_items) else 'unknown'
+                                    ref_emb_norm = ref_embedding[idx].norm().item()
+                                    gen_emb_norm = gen_embedding[idx].norm().item()
+                                    has_bbox = scaled_bboxes is not None and idx < len(scaled_bboxes) and scaled_bboxes[idx] is not None
+
+                                    # Use the actual ArcFace input crop (not a reconstruction)
+                                    crop_img = TF.to_pil_image(_arcface_crops[idx].clamp(0, 1).cpu())
+
+                                    # Build combined: [noisy | x0 | crop_112x112]
+                                    from PIL import Image as PILImage, ImageDraw
+                                    h = pred_img.height
+                                    crop_resized = crop_img.resize((h, h))  # scale crop to match height
+                                    panels = [pred_img, crop_resized]
+                                    if noisy_pixels is not None:
+                                        noisy_img = TF.to_pil_image(noisy_pixels[idx].clamp(0, 1).cpu())
+                                        panels.insert(0, noisy_img)
+                                    total_w = sum(p.width for p in panels)
+                                    combined = PILImage.new('RGB', (total_w, h + 20), color=(0, 0, 0))
+                                    x_off = 0
+                                    for p in panels:
+                                        combined.paste(p, (x_off, 0))
+                                        x_off += p.width
+                                    # Draw bbox on x0 prediction panel
+                                    if has_bbox:
+                                        draw = ImageDraw.Draw(combined)
+                                        bx_off = panels[0].width if noisy_pixels is not None else 0
+                                        bx1c, by1c, bx2c, by2c = [float(v) for v in scaled_bboxes[idx]]
+                                        draw.rectangle([bx_off + bx1c, by1c, bx_off + bx2c, by2c], outline='lime', width=2)
+                                    # Annotate bottom strip
+                                    draw = ImageDraw.Draw(combined)
+                                    label = f"cos={cos_val:.3f} t={t_val:.2f} bbox={'Y' if has_bbox else 'N'} ref_n={ref_emb_norm:.3f} gen_n={gen_emb_norm:.3f}"
+                                    draw.text((4, h + 2), label, fill='white')
+                                    combined.save(os.path.join(id_preview_dir, f'{src_name}_step{self.step_num:06d}_t{t_val:.2f}_cos{cos_val:.3f}.jpg'))
+
+                            # Console log per-sample breakdown every 50 steps
+                            if self.step_num % 50 == 0:
+                                for idx in range(x0_pixels.shape[0]):
+                                    src = os.path.basename(batch.file_items[idx].path) if idx < len(batch.file_items) else '?'
+                                    cs = cos_sim[idx].item()
+                                    tr = t_ratio[idx].item()
+                                    rv = ref_valid[idx].item() if ref_valid is not None else '?'
+                                    hm = high_noise_mask[idx].item()
+                                    mm = metric_mask[idx].item()
+                                    lm = loss_mask[idx].item()
+                                    hb = scaled_bboxes is not None and idx < len(scaled_bboxes) and scaled_bboxes[idx] is not None
+                                    re_n = ref_embedding[idx].norm().item()
+                                    ge_n = gen_embedding[idx].norm().item()
+                                    fd = _face_detected[idx].item()
+                                    print(f"  ID[{idx}] {src}: cos={cs:.3f} t={tr:.2f} ref_valid={rv} hnm={hm} mm={mm} lm={lm} face={fd} bbox={hb} ref_norm={re_n:.3f} gen_norm={ge_n:.3f}")
+
+                # --- Landmark shape loss (MediaPipe FaceMesh weighted region MSE) ---
+                if _need_landmark_loss:
+                    lm_weight = t_ratio
+                    gen_landmarks = self.landmark_loss_model(x0_pixels, bboxes=scaled_bboxes)  # (B, 478, 2)
+
+                    ref_landmarks = batch.landmark_embedding.to(
+                        gen_landmarks.device, dtype=gen_landmarks.dtype)
+
+                    # Valid mask: reference landmarks are non-zero, timestep in window,
+                    # and face is recognizable (reuse identity cos_sim if available)
+                    lm_valid_mask = (ref_landmarks.abs().sum(dim=(-1, -2)) > 0) & high_noise_mask
+                    if cos_sim is not None:
+                        lm_cos_threshold = torch.tensor(
+                            [v if v is not None else self.face_id_config.identity_loss_min_cos
+                             for v in batch.identity_loss_min_cos_list],
+                            device=cos_sim.device, dtype=cos_sim.dtype,
+                        )
+                        lm_valid_mask = lm_valid_mask & (cos_sim.detach() > lm_cos_threshold)
+
+                    # MediaPipe FaceMesh region indices
+                    jaw_idx = DifferentiableLandmarkEncoder.FACE_OVAL    # weight 3x
+                    mouth_idx = DifferentiableLandmarkEncoder.LIPS       # weight 2x
+                    mid_idx = DifferentiableLandmarkEncoder.MIDFACE      # weight 1x
+
+                    lm_loss_per_sample = torch.zeros(gen_landmarks.shape[0],
+                                                     device=gen_landmarks.device)
+                    _lm_eps = 1e-6  # prevent NaN grad from sqrt(0)
+                    for b_idx in range(gen_landmarks.shape[0]):
+                        if not lm_valid_mask[b_idx]:
+                            continue
+                        gen = gen_landmarks[b_idx]   # (478, 2)
+                        ref = ref_landmarks[b_idx]   # (478, 2)
+                        jaw_loss = (gen[jaw_idx] - ref[jaw_idx]).pow(2).sum(-1).clamp(min=_lm_eps).sqrt().mean()
+                        mouth_loss = (gen[mouth_idx] - ref[mouth_idx]).pow(2).sum(-1).clamp(min=_lm_eps).sqrt().mean()
+                        mid_loss = (gen[mid_idx] - ref[mid_idx]).pow(2).sum(-1).clamp(min=_lm_eps).sqrt().mean()
+                        lm_loss_per_sample[b_idx] = (jaw_loss * 3 + mouth_loss * 2 + mid_loss * 1) / 6.0
+
+                    # Gate by per-sample landmark weights
+                    per_sample_lm_w = batch.landmark_loss_weight_list
+                    _has_per_ds_lm_w = any(w is not None for w in per_sample_lm_w)
+                    if _has_per_ds_lm_w:
+                        global_lm_w = self.face_id_config.landmark_loss_weight
+                        lm_weights = torch.tensor(
+                            [w if w is not None else global_lm_w for w in per_sample_lm_w],
+                            device=lm_valid_mask.device, dtype=torch.float32,
+                        )
+                        lm_valid_mask = lm_valid_mask & (lm_weights > 0)
+
+                    lm_loss_per_sample = lm_loss_per_sample * lm_weight * lm_valid_mask.float()
+                    lm_loss = lm_loss_per_sample.sum() / max(lm_valid_mask.sum().item(), 1.0)
+
+                    if lm_valid_mask.any():
+                        if _has_per_ds_lm_w:
+                            weighted_lm = (lm_loss_per_sample * lm_weights)
+                            lm_applied = weighted_lm.sum() / max(lm_valid_mask.sum().item(), 1.0)
+                        else:
+                            lm_applied = self.face_id_config.landmark_loss_weight * lm_loss
+                        loss = loss + lm_applied
+                        self._last_landmark_loss_applied = lm_applied.detach().item()
+                    with torch.no_grad():
+                        if lm_valid_mask.any():
+                            raw_lm = lm_loss_per_sample.sum() / lm_valid_mask.sum().item()
+                            self._last_landmark_loss = raw_lm.item()
+                            # binned shape similarity by timestep (0.1 bands)
+                            if self._last_shape_sim_bins is None:
+                                self._last_shape_sim_bins = {}
+                            for idx in range(lm_loss_per_sample.shape[0]):
+                                if lm_valid_mask[idx]:
+                                    t_val = t_ratio[idx].item()
+                                    bin_start = int(t_val * 10) / 10.0
+                                    bin_key = f'shape_sim_t{int(bin_start*100):02d}'
+                                    self._last_shape_sim_bins[bin_key] = lm_loss_per_sample[idx].item()
+
+                # --- Body proportion loss (ViTPose bone-length ratio matching) ---
+                if _need_body_proportion_loss:
+                    bp_weight = t_ratio
+                    _bp_include_head = getattr(self.face_id_config, 'body_proportion_include_head', False)
+                    ref_bp = batch.body_proportion_embedding.to(
+                        x0_pixels.device, dtype=x0_pixels.dtype)
+                    _bp_n = ref_bp.shape[-1] // 2  # first half = ratios, second half = vis
+                    ref_ratios = ref_bp[:, :_bp_n]
+
+                    # Scale person bboxes from original image coords to x0_pixels coords
+                    # Same pipeline as face bboxes: orig -> scale -> crop -> x0_pixels
+                    scaled_person_bboxes = None
+                    if batch.person_bboxes is not None:
+                        _, _, px_h, px_w = x0_pixels.shape
+                        scaled_person_bboxes = []
+                        for idx in range(x0_pixels.shape[0]):
+                            raw_bbox = batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None
+                            if raw_bbox is not None and raw_bbox.abs().sum() > 0:
+                                fi = batch.file_items[idx]
+                                orig_w = float(fi.width)
+                                orig_h = float(fi.height)
+                                pbx1, pby1, pbx2, pby2 = raw_bbox.float()
+
+                                stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
+                                sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
+                                pbx1 = pbx1 * (stw / orig_w)
+                                pby1 = pby1 * (sth / orig_h)
+                                pbx2 = pbx2 * (stw / orig_w)
+                                pby2 = pby2 * (sth / orig_h)
+
+                                cx = float(getattr(fi, 'crop_x', None) or 0)
+                                cy = float(getattr(fi, 'crop_y', None) or 0)
+                                cw = float(getattr(fi, 'crop_width', None) or stw)
+                                ch = float(getattr(fi, 'crop_height', None) or sth)
+                                pbx1 = pbx1 - cx
+                                pby1 = pby1 - cy
+                                pbx2 = pbx2 - cx
+                                pby2 = pby2 - cy
+
+                                if pbx2 <= 0 or pby2 <= 0 or pbx1 >= cw or pby1 >= ch:
+                                    scaled_person_bboxes.append(None)
+                                    continue
+
+                                pbx1 = pbx1 * (px_w / cw)
+                                pby1 = pby1 * (px_h / ch)
+                                pbx2 = pbx2 * (px_w / cw)
+                                pby2 = pby2 * (px_h / ch)
+
+                                pbx1 = max(0.0, min(pbx1, float(px_w)))
+                                pby1 = max(0.0, min(pby1, float(px_h)))
+                                pbx2 = max(0.0, min(pbx2, float(px_w)))
+                                pby2 = max(0.0, min(pby2, float(px_h)))
+
+                                scaled_person_bboxes.append([pbx1, pby1, pbx2, pby2])
+                            else:
+                                scaled_person_bboxes.append(None)
+
+                    # ViTPose works best with full images — no person cropping needed
+                    gen_ratios, gen_vis = self.body_proportion_model(
+                        x0_pixels, ref_ratios=ref_ratios, include_head=_bp_include_head)  # (B, N), (B, N)
+                    ref_vis = ref_bp[:, _bp_n:]
+
+                    # Valid mask: reference embedding is non-zero AND timestep in body's own window
+                    bp_valid_mask = (ref_bp.abs().sum(dim=-1) > 0) & bp_noise_mask
+
+                    # Build per-sample body proportion weights early — gate valid mask
+                    per_sample_bp_w = batch.body_proportion_loss_weight_list
+                    _has_per_ds_bp_w = any(w is not None for w in per_sample_bp_w)
+                    if _has_per_ds_bp_w:
+                        global_bp_w = self.face_id_config.body_proportion_loss_weight
+                        bp_weights = torch.tensor(
+                            [w if w is not None else global_bp_w for w in per_sample_bp_w],
+                            device=bp_valid_mask.device, dtype=torch.float32,
+                        )
+                        bp_valid_mask = bp_valid_mask & (bp_weights > 0)
+
+                    # Use minimum of reference and generated visibility as weight
+                    combined_vis = torch.min(ref_vis, gen_vis)
+                    weighted_diff = (gen_ratios - ref_ratios).abs() * combined_vis
+                    bp_loss_per_sample = weighted_diff.sum(dim=-1) / combined_vis.sum(dim=-1).clamp(min=1e-6)
+
+                    # Penalize missing keypoints: ref has high confidence (>=0.5) but gen dropped below threshold
+                    _bp_vis_threshold = 0.2
+                    missing_mask = (ref_vis >= 0.5) & (gen_vis < _bp_vis_threshold)
+                    missing_count = missing_mask.float().sum(dim=-1)  # (B,) how many ratios were dropped
+                    ref_high_count = (ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                    # Penalty = fraction of high-confidence reference ratios that prediction dropped
+                    visibility_penalty = missing_count / ref_high_count  # (B,) in [0, 1]
+                    bp_loss_per_sample = bp_loss_per_sample + visibility_penalty
+                    bp_loss_per_sample = bp_loss_per_sample * bp_weight * bp_valid_mask.float()
+                    bp_loss = bp_loss_per_sample.sum() / max(bp_valid_mask.sum().item(), 1.0)
+
+                    if bp_valid_mask.any():
+                        if _has_per_ds_bp_w:
+                            weighted_bp = (bp_loss_per_sample * bp_weights)
+                            bp_applied = weighted_bp.sum() / max(bp_valid_mask.sum().item(), 1.0)
+                        else:
+                            bp_applied = self.face_id_config.body_proportion_loss_weight * bp_loss
+                        loss = loss + bp_applied
+                        self._last_body_proportion_loss_applied = bp_applied.detach().item()
+                    with torch.no_grad():
+                        if bp_valid_mask.any():
+                            raw_bp = bp_loss_per_sample.sum() / bp_valid_mask.sum().item()
+                            self._last_body_proportion_loss = raw_bp.item()
+                            # binned by timestep (0.1 bands)
+                            if self._last_bp_sim_bins is None:
+                                self._last_bp_sim_bins = {}
+                            for idx in range(bp_loss_per_sample.shape[0]):
+                                if bp_valid_mask[idx]:
+                                    t_val = t_ratio[idx].item()
+                                    bin_start = int(t_val * 10) / 10.0
+                                    bin_key = f'bp_sim_t{int(bin_start*100):02d}'
+                                    self._last_bp_sim_bins[bin_key] = 1.0 - bp_loss_per_sample[idx].item()
+
+                            # Save skeleton preview images (prediction + reference side-by-side)
+                            from toolkit.body_id import draw_skeleton_overlay
+                            from PIL import Image as PILImage
+                            from PIL.ImageOps import exif_transpose
+                            bp_preview_dir = os.path.join(self.save_root, 'body_previews')
+                            os.makedirs(bp_preview_dir, exist_ok=True)
+                            for idx in range(x0_pixels.shape[0]):
+                                if bp_valid_mask[idx]:
+                                    try:
+                                        import dsntnn as _dsntnn
+                                        pred_pil = TF.to_pil_image(x0_pixels[idx].clamp(0, 1).cpu())
+                                        pw, ph = pred_pil.size
+                                        pred_bbox = [0, 0, pw, ph]
+
+                                        # Run ViTPose via HF processor on prediction (correct coords)
+                                        pred_inputs = self.body_proportion_model.processor(
+                                            images=pred_pil, boxes=[[[0, 0, pw, ph]]], return_tensors="pt"
+                                        )
+                                        pred_pv = pred_inputs['pixel_values'].to(
+                                            device=x0_pixels.device,
+                                            dtype=next(self.body_proportion_model.model.parameters()).dtype,
+                                        )
+                                        pred_out = self.body_proportion_model.model(pred_pv, dataset_index=torch.tensor([0], device=pred_pv.device))
+                                        pred_out.heatmaps = pred_out.heatmaps.float()
+                                        pred_results = self.body_proportion_model.processor.post_process_pose_estimation(
+                                            pred_out, boxes=[[[0, 0, pw, ph]]]
+                                        )[0]
+                                        if pred_results:
+                                            pkp = pred_results[0]['keypoints']
+                                            pscores = pred_results[0]['scores']
+                                            pkp_norm = torch.zeros(17, 2)
+                                            pkp_norm[:, 0] = pkp[:, 0] / pw
+                                            pkp_norm[:, 1] = pkp[:, 1] / ph
+                                            pred_skeleton = draw_skeleton_overlay(pred_pil, pkp_norm, pscores)
+                                        else:
+                                            pred_skeleton = pred_pil
+
+                                        # Run ViTPose via HF processor on reference
+                                        ref_path = batch.file_items[idx].path
+                                        ref_pil = exif_transpose(PILImage.open(ref_path)).convert('RGB')
+                                        rw, rh = ref_pil.size
+                                        ref_inputs = self.body_proportion_model.processor(
+                                            images=ref_pil, boxes=[[[0, 0, rw, rh]]], return_tensors="pt"
+                                        )
+                                        ref_pv = ref_inputs['pixel_values'].to(
+                                            device=x0_pixels.device,
+                                            dtype=next(self.body_proportion_model.model.parameters()).dtype,
+                                        )
+                                        ref_out = self.body_proportion_model.model(ref_pv, dataset_index=torch.tensor([0], device=ref_pv.device))
+                                        ref_out.heatmaps = ref_out.heatmaps.float()
+                                        ref_results = self.body_proportion_model.processor.post_process_pose_estimation(
+                                            ref_out, boxes=[[[0, 0, rw, rh]]]
+                                        )[0]
+                                        if ref_results:
+                                            rkp = ref_results[0]['keypoints']
+                                            rscores = ref_results[0]['scores']
+                                            rkp_norm = torch.zeros(17, 2)
+                                            rkp_norm[:, 0] = rkp[:, 0] / rw
+                                            rkp_norm[:, 1] = rkp[:, 1] / rh
+                                            ref_pil = ref_pil.resize(pred_pil.size)
+                                            ref_skeleton = draw_skeleton_overlay(ref_pil, rkp_norm, rscores)
+                                        else:
+                                            ref_skeleton = ref_pil.resize(pred_pil.size)
+
+                                        # Side-by-side: reference | prediction
+                                        combined = PILImage.new('RGB', (ref_skeleton.width + pred_skeleton.width, max(ref_skeleton.height, pred_skeleton.height)))
+                                        combined.paste(ref_skeleton, (0, 0))
+                                        combined.paste(pred_skeleton, (ref_skeleton.width, 0))
+                                    except Exception as e:
+                                        print_acc(f"  body preview failed: {e}")
+                                        combined = TF.to_pil_image(x0_pixels[idx].clamp(0, 1).cpu())
+
+                                    t_val = t_ratio[idx].item()
+                                    bp_val = bp_loss_per_sample[idx].item()
+                                    src_name = os.path.splitext(os.path.basename(batch.file_items[idx].path))[0] if idx < len(batch.file_items) else 'unknown'
+                                    combined.save(os.path.join(
+                                        bp_preview_dir,
+                                        f'{src_name}_step{self.step_num:06d}_t{t_val:.2f}_bp{bp_val:.4f}.jpg'
+                                    ))
+
+                # --- Body shape loss (HybrIK SMPL beta matching) ---
+                if _need_body_shape_loss and bsh_noise_mask.any():
+                    bsh_weight = t_ratio  # timestep weighting (higher noise → more weight)
+
+                    ref_betas = batch.body_shape_embedding.to(
+                        x0_pixels.device, dtype=x0_pixels.dtype)
+
+                    # Scale person bboxes (reuse same pattern as body proportion)
+                    scaled_person_bboxes_bsh = None
+                    if batch.person_bboxes is not None:
+                        _, _, px_h, px_w = x0_pixels.shape
+                        scaled_person_bboxes_bsh = []
+                        for idx in range(x0_pixels.shape[0]):
+                            raw_pb = batch.person_bboxes[idx] if idx < len(batch.person_bboxes) else None
+                            if raw_pb is not None:
+                                fi = batch.file_items[idx]
+                                orig_w, orig_h = float(fi.width), float(fi.height)
+                                pbx1, pby1, pbx2, pby2 = raw_pb.float()
+                                stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
+                                sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
+                                pbx1 = pbx1 * (stw / orig_w)
+                                pby1 = pby1 * (sth / orig_h)
+                                pbx2 = pbx2 * (stw / orig_w)
+                                pby2 = pby2 * (sth / orig_h)
+                                cx = float(getattr(fi, 'crop_x', None) or 0)
+                                cy = float(getattr(fi, 'crop_y', None) or 0)
+                                cw = float(getattr(fi, 'crop_width', None) or stw)
+                                ch = float(getattr(fi, 'crop_height', None) or sth)
+                                pbx1 -= cx; pby1 -= cy; pbx2 -= cx; pby2 -= cy
+                                if pbx2 <= 0 or pby2 <= 0 or pbx1 >= cw or pby1 >= ch:
+                                    scaled_person_bboxes_bsh.append(None)
+                                    continue
+                                pbx1 = max(0.0, pbx1 * (px_w / cw))
+                                pby1 = max(0.0, pby1 * (px_h / ch))
+                                pbx2 = min(float(px_w), pbx2 * (px_w / cw))
+                                pby2 = min(float(px_h), pby2 * (px_h / ch))
+                                scaled_person_bboxes_bsh.append([pbx1, pby1, pbx2, pby2])
+                            else:
+                                scaled_person_bboxes_bsh.append(None)
+
+                    # Run HybrIK on decoded x0
+                    gen_betas = self.body_shape_model(
+                        x0_pixels, person_bboxes=scaled_person_bboxes_bsh
+                    )  # (B, 10)
+
+                    # Metric mask: reference non-zero AND timestep in window
+                    bsh_metric_mask = (ref_betas.abs().sum(dim=-1) > 0) & bsh_noise_mask
+
+                    # Cosine similarity for gating and logging
+                    bsh_cos = F.cosine_similarity(gen_betas, ref_betas, dim=-1)  # (B,)
+
+                    # Loss mask: also gate by per-sample cosine threshold
+                    bsh_cos_threshold = torch.tensor(
+                        [v if v is not None else self.face_id_config.body_shape_loss_min_cos
+                         for v in batch.body_shape_loss_min_cos_list],
+                        device=bsh_cos.device, dtype=bsh_cos.dtype,
+                    )
+                    bsh_valid_mask = bsh_metric_mask & (bsh_cos.detach() > bsh_cos_threshold)
+
+                    # Gate by per-sample body shape weights
+                    per_sample_bsh_w = batch.body_shape_loss_weight_list
+                    _has_per_ds_bsh_w = any(w is not None for w in per_sample_bsh_w)
+                    if _has_per_ds_bsh_w:
+                        global_bsh_w = self.face_id_config.body_shape_loss_weight
+                        bsh_weights = torch.tensor(
+                            [w if w is not None else global_bsh_w for w in per_sample_bsh_w],
+                            device=bsh_valid_mask.device, dtype=torch.float32,
+                        )
+                        bsh_valid_mask = bsh_valid_mask & (bsh_weights > 0)
+
+                    # L1 loss on 10-dim betas
+                    bsh_loss_per_sample = (gen_betas - ref_betas).abs().mean(dim=-1)
+                    bsh_loss_per_sample = bsh_loss_per_sample * bsh_weight * bsh_valid_mask.float()
+                    bsh_loss = bsh_loss_per_sample.sum() / max(bsh_valid_mask.sum().item(), 1.0)
+
+                    if bsh_valid_mask.any():
+                        if _has_per_ds_bsh_w:
+                            weighted_bsh = bsh_loss_per_sample * bsh_weights
+                            bsh_applied = weighted_bsh.sum() / max(bsh_valid_mask.sum().item(), 1.0)
+                        else:
+                            bsh_applied = self.face_id_config.body_shape_loss_weight * bsh_loss
+                        loss = loss + bsh_applied
+                        self._last_body_shape_loss_applied = bsh_applied.detach().item()
+                    with torch.no_grad():
+                        # Log using metric_mask (no cosine gate) so metrics work even when gated
+                        if bsh_metric_mask.any():
+                            n_metric = bsh_metric_mask.sum().item()
+                            n_gated = bsh_valid_mask.sum().item()
+
+                            # Raw L1 (unweighted, always computed)
+                            raw_l1 = (gen_betas - ref_betas).abs().mean(dim=-1)
+                            raw_l1_mean = (raw_l1 * bsh_metric_mask.float()).sum() / n_metric
+                            self._last_body_shape_l1 = raw_l1_mean.item()
+
+                            # Applied loss
+                            raw_bsh = (bsh_loss_per_sample.sum() / n_metric
+                                       if n_gated > 0 else 0.0)
+                            self._last_body_shape_loss = raw_bsh if isinstance(raw_bsh, float) else raw_bsh.item()
+
+                            # Cosine similarity
+                            bsh_cos_mean = (bsh_cos * bsh_metric_mask.float()).sum() / n_metric
+                            self._last_body_shape_cos = bsh_cos_mean.item()
+
+                            # Gated percentage
+                            self._last_body_shape_gated_pct = n_gated / n_metric
+
+                            # Cosine binned by timestep
+                            if self._last_bsh_sim_bins is None:
+                                self._last_bsh_sim_bins = {}
+                            for idx in range(bsh_cos.shape[0]):
+                                if bsh_metric_mask[idx]:
+                                    t_val = t_ratio[idx].item()
+                                    bin_start = int(t_val * 10) / 10.0
+                                    bin_key = f'bsh_sim_t{int(bin_start*100):02d}'
+                                    self._last_bsh_sim_bins[bin_key] = bsh_cos[idx].item()
+
+                # --- Normal map loss (Sapiens surface normal matching) ---
+                if _need_normal_loss and nrm_noise_mask.any():
+                    nrm_weight = t_ratio  # timestep weighting
+
+                    ref_normals = batch.normal_embedding.to(
+                        x0_pixels.device, dtype=x0_pixels.dtype)  # (B, 3, 256, 256)
+
+                    # Run Sapiens on decoded x0
+                    gen_normals = self.normal_model(x0_pixels)  # (B, 3, 256, 256)
+
+                    # Valid mask: reference non-zero AND timestep in window
+                    ref_valid = (ref_normals.abs().sum(dim=1).sum(dim=(1, 2)) > 0)  # (B,)
+                    nrm_valid_mask = ref_valid & nrm_noise_mask
+
+                    # Gate by per-sample normal weights
+                    per_sample_nrm_w = batch.normal_loss_weight_list
+                    _has_per_ds_nrm_w = any(w is not None for w in per_sample_nrm_w)
+                    if _has_per_ds_nrm_w:
+                        global_nrm_w = self.face_id_config.normal_loss_weight
+                        nrm_weights = torch.tensor(
+                            [w if w is not None else global_nrm_w for w in per_sample_nrm_w],
+                            device=nrm_valid_mask.device, dtype=torch.float32,
+                        )
+                        nrm_valid_mask = nrm_valid_mask & (nrm_weights > 0)
+
+                    if nrm_valid_mask.any():
+                        # Cosine dissimilarity per pixel, averaged spatially
+                        cos_per_pixel = (ref_normals * gen_normals).sum(dim=1)  # (B, H, W)
+                        cos_mean = cos_per_pixel.mean(dim=(1, 2))  # (B,)
+                        cos_loss = 1.0 - cos_mean  # (B,)
+
+                        # L1 per pixel, averaged spatially
+                        l1_per_pixel = (ref_normals - gen_normals).abs().mean(dim=1)  # (B, H, W)
+                        l1_mean = l1_per_pixel.mean(dim=(1, 2))  # (B,)
+
+                        # Combined loss: L1 + cosine dissimilarity (same as Sapiens training)
+                        nrm_loss_per_sample = (cos_loss + l1_mean) * nrm_weight * nrm_valid_mask.float()
+                        nrm_loss = nrm_loss_per_sample.sum() / max(nrm_valid_mask.sum().item(), 1.0)
+
+                        if _has_per_ds_nrm_w:
+                            weighted_nrm = nrm_loss_per_sample * nrm_weights
+                            nrm_applied = weighted_nrm.sum() / max(nrm_valid_mask.sum().item(), 1.0)
+                        else:
+                            nrm_applied = self.face_id_config.normal_loss_weight * nrm_loss
+                        loss = loss + nrm_applied
+                        self._last_normal_loss_applied = nrm_applied.detach().item()
+
+                    with torch.no_grad():
+                        if nrm_valid_mask.any():
+                            n_v = nrm_valid_mask.sum().item()
+                            cos_per_px = (ref_normals * gen_normals).sum(dim=1)
+                            raw_cos = (cos_per_px.mean(dim=(1, 2)) * nrm_valid_mask.float()).sum() / n_v
+                            self._last_normal_cos = raw_cos.item()
+
+                            raw_l1 = (ref_normals - gen_normals).abs().mean(dim=(1, 2, 3))
+                            raw_l1_mean = (raw_l1 * nrm_valid_mask.float()).sum() / n_v
+                            self._last_normal_loss = raw_l1_mean.item()
+
+                            # Save normal preview: ref | gen | x0_pred side by side
+                            nrm_preview_dir = os.path.join(self.save_root, 'normal_previews')
+                            os.makedirs(nrm_preview_dir, exist_ok=True)
+                            for idx in range(gen_normals.shape[0]):
+                                if nrm_valid_mask[idx]:
+                                    # Normal maps to RGB: (n+1)/2 maps [-1,1] to [0,1]
+                                    ref_rgb = ((ref_normals[idx] + 1) * 0.5).clamp(0, 1).cpu()
+                                    gen_rgb = ((gen_normals[idx] + 1) * 0.5).clamp(0, 1).cpu()
+                                    pred_rgb = x0_pixels[idx].clamp(0, 1).cpu()
+
+                                    ref_img = TF.to_pil_image(ref_rgb)
+                                    gen_img = TF.to_pil_image(gen_rgb)
+                                    pred_img = TF.to_pil_image(pred_rgb)
+
+                                    # Resize all to same height for comparison
+                                    h = ref_img.height
+                                    pred_img = pred_img.resize((int(pred_img.width * h / pred_img.height), h))
+
+                                    from PIL import Image as PILImage
+                                    total_w = ref_img.width + gen_img.width + pred_img.width + 8
+                                    combined = PILImage.new('RGB', (total_w, h))
+                                    x_off = 0
+                                    combined.paste(ref_img, (x_off, 0)); x_off += ref_img.width + 4
+                                    combined.paste(gen_img, (x_off, 0)); x_off += gen_img.width + 4
+                                    combined.paste(pred_img, (x_off, 0))
+
+                                    cos_val = cos_per_px[idx].mean().item()
+                                    t_val = t_ratio[idx].item()
+                                    src_name = os.path.splitext(os.path.basename(
+                                        batch.file_items[idx].path))[0] if idx < len(batch.file_items) else 'unknown'
+                                    combined.save(os.path.join(
+                                        nrm_preview_dir,
+                                        f'{src_name}_step{self.step_num:06d}_t{t_val:.2f}_cos{cos_val:.3f}.jpg'
+                                    ))
+
+                # --- VAE anchor loss (perceptual feature matching) ---
+                if _need_vae_anchor_loss and va_noise_mask.any():
+                    va_weight = torch.ones_like(t_ratio)  # uniform — gating window handles timestep filtering
+
+                    # Reference features from batch (cached)
+                    ref_features = batch.vae_anchor_features
+
+                    # Check ref features are valid (not zero-padded from failed caching)
+                    from toolkit.vae_anchor import FEATURE_LEVELS as _VA_LEVELS
+                    ref_valid = torch.stack([
+                        ref_features[level].abs().sum(dim=(1, 2, 3)) > 0
+                        for level in _VA_LEVELS if level in ref_features
+                    ], dim=0).all(dim=0).to(va_noise_mask.device)  # (B,)
+
+                    # Build valid mask: timestep in window AND ref features non-zero
+                    va_valid_mask = va_noise_mask & ref_valid
+
+                    # Gate by per-dataset weights
+                    per_sample_va_w = batch.vae_anchor_loss_weight_list
+                    _has_per_ds_va_w = any(w is not None for w in per_sample_va_w)
+                    if _has_per_ds_va_w:
+                        global_va_w = self.face_id_config.vae_anchor_loss_weight
+                        va_weights = torch.tensor(
+                            [w if w is not None else global_va_w for w in per_sample_va_w],
+                            device=va_valid_mask.device, dtype=torch.float32,
+                        )
+                        va_valid_mask = va_valid_mask & (va_weights > 0)
+
+                    if va_valid_mask.any():
+                        # SDXL VAE decode (bf16, differentiable) → clean pixels
+                        # Flux 2 encoder (f32) → perceptual features for loss
+                        # Free cached CUDA blocks first to defragment before large allocations
+                        torch.cuda.empty_cache()
+                        if next(self.sd.vae.parameters()).device != self.device_torch:
+                            self.sd.vae.to(self.device_torch)
+                        vae_dtype = self.sd.vae.dtype
+                        x0_unscaled = x0_pred / self.sd.vae.config['scaling_factor']
+                        if 'shift_factor' in self.sd.vae.config and self.sd.vae.config['shift_factor']:
+                            x0_unscaled = x0_unscaled + self.sd.vae.config['shift_factor']
+                        x0_vae_pixels = self.sd.vae.decode(x0_unscaled.to(vae_dtype)).sample.clamp(-1, 1)
+                        with torch.amp.autocast('cuda', enabled=False):
+                            _, pred_features = self.vae_anchor_encoder.encode_with_features(x0_vae_pixels.float())
+
+                        # Compute cosine loss per feature level — returns (B,) per-sample losses
+                        va_loss_per_sample, va_per_level = VAEAnchorEncoder.compute_loss(
+                            pred_features, ref_features
+                        )
+
+                        # Apply timestep weighting and valid mask per-sample
+                        va_loss_per_sample = va_loss_per_sample * va_weight * va_valid_mask.float()
+                        va_active_count = max(va_valid_mask.sum().item(), 1.0)
+
+                        if _has_per_ds_va_w:
+                            weighted_va = va_loss_per_sample * va_weights
+                            va_applied = weighted_va.sum() / va_active_count
+                        else:
+                            va_loss = va_loss_per_sample.sum() / va_active_count
+                            va_applied = self.face_id_config.vae_anchor_loss_weight * va_loss
+                        loss = loss + va_applied
+                        self._last_vae_anchor_loss_applied = va_applied.detach().item()
+
+                        with torch.no_grad():
+                            self._last_vae_anchor_loss = (va_loss_per_sample.sum() / va_active_count).item()
+                            self._last_vae_anchor_per_level = va_per_level
+
+                            # Save VAE anchor previews (every N steps)
+                            _va_preview_every = 500
+                            if self.step_num % _va_preview_every == 0:
+                                try:
+                                    va_preview_dir = os.path.join(self.save_root, 'vae_anchor_previews')
+                                    os.makedirs(va_preview_dir, exist_ok=True)
+                                    va_preview = (x0_vae_pixels.detach().float() + 1.0) * 0.5
+                                    for idx in range(va_preview.shape[0]):
+                                        if va_valid_mask[idx]:
+                                            pred_rgb = va_preview[idx].clamp(0, 1).cpu()
+                                            pred_img = TF.to_pil_image(pred_rgb)
+
+                                            heatmap_imgs = []
+                                            for level_name in ['level_1', 'level_2', 'level_3', 'mid']:
+                                                if level_name in pred_features and level_name in ref_features:
+                                                    pf = pred_features[level_name][idx]
+                                                    rf = ref_features[level_name][idx].to(pf.device, dtype=pf.dtype)
+                                                    if pf.shape[1:] != rf.shape[1:]:
+                                                        rf = F.interpolate(
+                                                            rf.unsqueeze(0), size=pf.shape[1:],
+                                                            mode='bilinear', align_corners=False
+                                                        ).squeeze(0)
+                                                    diff = (pf - rf).pow(2).mean(dim=0)
+                                                    diff_min = diff.min()
+                                                    diff_max = diff.max()
+                                                    if diff_max > diff_min:
+                                                        diff_norm = (diff - diff_min) / (diff_max - diff_min)
+                                                    else:
+                                                        diff_norm = torch.zeros_like(diff)
+                                                    h_img = diff_norm.cpu().unsqueeze(0).repeat(3, 1, 1)
+                                                    h_img[1] = 1.0 - h_img[1]
+                                                    h_img[2] = 0.0
+                                                    heatmap_pil = TF.to_pil_image(h_img.clamp(0, 1))
+                                                    heatmap_pil = heatmap_pil.resize(
+                                                        (pred_img.height, pred_img.height)
+                                                    )
+                                                    heatmap_imgs.append(heatmap_pil)
+
+                                            from PIL import Image as PILImage
+                                            panels = [pred_img] + heatmap_imgs
+                                            total_w = sum(p.width for p in panels)
+                                            h = pred_img.height
+                                            combined = PILImage.new('RGB', (total_w, h + 20), color=(0, 0, 0))
+                                            x_off = 0
+                                            for p in panels:
+                                                combined.paste(p, (x_off, 0))
+                                                x_off += p.width
+
+                                            from PIL import ImageDraw
+                                            draw = ImageDraw.Draw(combined)
+                                            t_val = t_ratio[idx].item()
+                                            level_str = ' '.join(f'{k}={v:.4f}' for k, v in va_per_level.items())
+                                            draw.text((4, h + 2), f't={t_val:.2f} total={va_loss_per_sample[idx].item():.4f} {level_str}', fill='white')
+                                            src_name = os.path.splitext(os.path.basename(
+                                                batch.file_items[idx].path))[0] if idx < len(batch.file_items) else 'unknown'
+                                            combined.save(os.path.join(
+                                                va_preview_dir,
+                                                f'{src_name}_step{self.step_num:06d}_t{t_val:.2f}_va{va_loss_per_sample[idx].item():.4f}.jpg'
+                                            ))
+                                except Exception as e:
+                                    print(f"Warning: VAE anchor preview failed: {e}")
+
+                        if self.step_num % 50 == 0:
+                            level_str = ' '.join(f'{k}={v:.4f}' for k, v in va_per_level.items())
+                            print(f"  [VAE anchor] step={self.step_num} total={(va_loss_per_sample.sum() / va_active_count).item():.4f} {level_str}")
+
+        # E-LatentLPIPS perceptual loss in latent space
+        if self.latent_perceptual_model is not None:
+            try:
+                lp_loss_raw, lp_loss_applied = self._compute_latent_perceptual_loss(
+                    noise_pred=noise_pred, noisy_latents=noisy_latents,
+                    timesteps=timesteps, batch=batch,
+                )
+                if lp_loss_applied is not None:
+                    loss = loss + lp_loss_applied
+                self._latent_perceptual_loss_accumulator += lp_loss_raw
+                self._latent_perceptual_loss_applied_accumulator += (lp_loss_applied.item() if lp_loss_applied is not None else 0.0)
+                self._latent_perceptual_accumulation_count += 1
+                self._lp_preview_cache = {
+                    'noise_pred': noise_pred.detach(), 'noisy_latents': noisy_latents.detach(),
+                    'timesteps': timesteps.detach(), 'batch_latents': batch.latents.detach(),
+                }
+            except Exception as e:
+                if self.step_num <= 2:
+                    print(f"WARNING: E-LatentLPIPS failed: {e}")
+                    print(f"  noise_pred shape: {noise_pred.shape}, noisy_latents shape: {noisy_latents.shape}")
+                    print(f"  timesteps: {timesteps}, is_flow_matching: {self.sd.is_flow_matching}")
+                    import traceback; traceback.print_exc()
 
         return loss + additional_loss
+
+    def _compute_latent_perceptual_loss(self, noise_pred, noisy_latents, timesteps, batch):
+        """Compute E-LatentLPIPS between x0_pred and target latents."""
+        bs = noise_pred.shape[0]
+        num_train_ts = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        t_01 = (timesteps.float() / num_train_ts).to(noise_pred.device)
+
+        # Per-sample timestep gating (per-dataset overrides fall back to global)
+        global_min_t = self.train_config.latent_perceptual_loss_min_t
+        global_max_t = self.train_config.latent_perceptual_loss_max_t
+        min_vals = torch.tensor(
+            [v if v is not None else global_min_t for v in batch.latent_perceptual_loss_min_t_list],
+            device=t_01.device, dtype=t_01.dtype,
+        )
+        max_vals = torch.tensor(
+            [v if v is not None else global_max_t for v in batch.latent_perceptual_loss_max_t_list],
+            device=t_01.device, dtype=t_01.dtype,
+        )
+        t_mask = ((t_01 >= min_vals) & (t_01 <= max_vals)).float()
+
+        # Per-dataset weight overrides
+        global_weight = self.train_config.latent_perceptual_loss_weight
+        per_sample_weights = torch.full((bs,), global_weight, device=noise_pred.device)
+        for idx, w in enumerate(batch.latent_perceptual_loss_weight_list):
+            if w is not None:
+                per_sample_weights[idx] = w
+
+        sample_weights = t_mask * per_sample_weights
+        if sample_weights.sum().item() < 1e-8:
+            return 0.0, None
+
+        # Recover x0_pred from model output
+        if self.sd.is_flow_matching:
+            # Flow matching: x0 = noisy - t * v_pred
+            t_expand = t_01.view(-1, 1, 1, 1)
+            if len(noise_pred.shape) == 5:
+                t_expand = t_01.view(-1, 1, 1, 1, 1)
+            x0_pred = noisy_latents - t_expand * noise_pred
+        else:
+            # DDPM: recover x0 from epsilon or v prediction
+            alphas_cumprod = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device, dtype=noisy_latents.dtype
+            )
+            alpha_bar = alphas_cumprod[timesteps.long()].view(-1, 1, 1, 1)
+            sqrt_alpha_bar = alpha_bar.sqrt()
+            sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+            if hasattr(self.sd, 'prediction_type') and self.sd.prediction_type == 'v_prediction':
+                x0_pred = sqrt_alpha_bar * noisy_latents - sqrt_one_minus_alpha_bar * noise_pred
+            else:
+                x0_pred = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
+
+        target_latents = batch.latents.to(noise_pred.device, dtype=noise_pred.dtype).detach()
+
+        # E-LatentLPIPS 'flux' encoder expects 16ch. If latents are packed
+        # (e.g. 128ch from Flux 2's 32ch VAE), unpack to spatial format first,
+        # then take the first 16 channels as an approximation.
+        x0_for_lp = x0_pred
+        tgt_for_lp = target_latents
+        ch = x0_for_lp.shape[1]
+        if ch > 16 and ch % 4 == 0:
+            # Unpack pixel-shuffle: (B, C*4, H, W) -> (B, C, H*2, W*2)
+            from einops import rearrange
+            z_ch = ch // 4  # 128 -> 32, or 64 -> 16
+            x0_for_lp = rearrange(x0_for_lp, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=z_ch, p1=2, p2=2)
+            tgt_for_lp = rearrange(tgt_for_lp, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=z_ch, p1=2, p2=2)
+        # If still > 16ch (e.g. 32ch Flux 2), take first 16
+        if x0_for_lp.shape[1] > 16:
+            x0_for_lp = x0_for_lp[:, :16]
+            tgt_for_lp = tgt_for_lp[:, :16]
+
+        lp_loss = self.latent_perceptual_model(
+            x0_for_lp.float(), tgt_for_lp.float(),
+            normalize=False, add_l1_loss=True, ensembling=False,
+        ).view(bs)
+
+        raw_loss = lp_loss.detach().mean().item()
+        weighted_loss = (lp_loss * sample_weights).mean()
+        return raw_loss, weighted_loss
+
+    def _save_latent_perceptual_preview(self, noise_pred, noisy_latents, timesteps, batch_latents):
+        """Save diagnostic preview: heatmap + decoded x0_pred + decoded target."""
+        preview_dir = os.path.join(self.save_root, 'latent_perceptual_previews')
+        os.makedirs(preview_dir, exist_ok=True)
+
+        num_train_ts = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        t_01 = (timesteps.float() / num_train_ts).to(noise_pred.device)
+        t_expand = t_01.view(-1, 1, 1, 1)
+        if len(noise_pred.shape) == 5:
+            t_expand = t_01.view(-1, 1, 1, 1, 1)
+
+        with torch.no_grad():
+            x0_pred = noisy_latents - t_expand * noise_pred
+            target_latents = batch_latents.to(noise_pred.device, dtype=noise_pred.dtype)
+
+            # Per-spatial L2 diff heatmap
+            diff = (x0_pred[:1].float() - target_latents[:1].float())
+            spatial_diff = diff.pow(2).mean(dim=1)[0]  # (H, W)
+            t_val = t_01[0].item()
+
+            diff_np = spatial_diff.sqrt().cpu().numpy()
+            diff_max = diff_np.max() if diff_np.max() > 0 else 1.0
+            heatmap = Image.fromarray((diff_np / diff_max * 255).astype(np.uint8), mode='L')
+
+            step_str = f'{self.step_num:09d}'
+            heatmap.save(os.path.join(preview_dir, f'step_{step_str}_t{t_val:.3f}_heatmap.png'))
+
+            # Per-channel diagnostics
+            print(f"[Latent Perceptual Preview] step={self.step_num}, t={t_val:.3f}")
+            for ch in range(min(diff.shape[1], 16)):
+                ch_diff = diff[0, ch]
+                print(f"  ch{ch:2d}: mean_diff={ch_diff.mean().item():+.4f}, "
+                      f"std_diff={ch_diff.std().item():.4f}, "
+                      f"max_abs={ch_diff.abs().max().item():.4f}")
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -1333,6 +3109,67 @@ class SDTrainer(BaseSDTrainProcess):
                     # make avg 1.0
                     mask_multiplier = mask_multiplier / mask_multiplier.mean()
 
+            # Face suppression mask: downweight loss in detected face bounding boxes
+            # Resolve per-sample None → global face_id_config fallback
+            _global_fsw = getattr(self.face_id_config, 'face_suppression_weight', None) if self.face_id_config else None
+            _resolved_fsw_list = [
+                (w if w is not None else _global_fsw) for w in batch.face_suppression_weight_list
+            ]
+            if any(w is not None and w > 0.0 for w in _resolved_fsw_list):
+                if batch.face_bboxes is not None:
+                    if len(noisy_latents.shape) == 5:
+                        lat_h, lat_w = noisy_latents.shape[3], noisy_latents.shape[4]
+                    else:
+                        lat_h, lat_w = noisy_latents.shape[2], noisy_latents.shape[3]
+                    face_supp_mask = torch.ones(
+                        (noisy_latents.shape[0], 1, lat_h, lat_w),
+                        device=self.device_torch, dtype=dtype,
+                    )
+                    for idx in range(noisy_latents.shape[0]):
+                        w = _resolved_fsw_list[idx]
+                        if w is None or w <= 0.0:
+                            continue
+                        # Invert: user-facing 0=no suppression, 1=full suppression
+                        # Internal mask needs 0=zero loss, 1=normal
+                        w = 1.0 - w
+                        raw_bbox = batch.face_bboxes[idx] if idx < len(batch.face_bboxes) else None
+                        if raw_bbox is None:
+                            continue
+                        fi = batch.file_items[idx]
+                        orig_w = float(fi.width)
+                        orig_h = float(fi.height)
+                        bx1, by1, bx2, by2 = [float(v) for v in raw_bbox]
+                        # scale to resized coords
+                        stw = float(getattr(fi, 'scale_to_width', None) or orig_w)
+                        sth = float(getattr(fi, 'scale_to_height', None) or orig_h)
+                        bx1 *= stw / orig_w; by1 *= sth / orig_h
+                        bx2 *= stw / orig_w; by2 *= sth / orig_h
+                        # crop offset
+                        cx = float(getattr(fi, 'crop_x', None) or 0)
+                        cy = float(getattr(fi, 'crop_y', None) or 0)
+                        cw = float(getattr(fi, 'crop_width', None) or stw)
+                        ch = float(getattr(fi, 'crop_height', None) or sth)
+                        bx1 -= cx; by1 -= cy; bx2 -= cx; by2 -= cy
+                        # skip if face is outside crop
+                        if bx2 <= 0 or by2 <= 0 or bx1 >= cw or by1 >= ch:
+                            continue
+                        # to latent coords
+                        bx1 = bx1 * lat_w / cw; bx2 = bx2 * lat_w / cw
+                        by1 = by1 * lat_h / ch; by2 = by2 * lat_h / ch
+                        # clamp and convert to int
+                        x1 = max(0, int(bx1)); y1 = max(0, int(by1))
+                        x2 = min(lat_w, int(bx2) + 1); y2 = min(lat_h, int(by2) + 1)
+                        if x2 > x1 and y2 > y1:
+                            face_supp_mask[idx, :, y1:y2, x1:x2] = w
+                    # expand to match latent channels for multiplication
+                    face_supp_mask = face_supp_mask.expand(-1, noisy_latents.shape[1], -1, -1)
+                    # normalize to mean=1 so total loss magnitude is preserved
+                    face_supp_mask = face_supp_mask / face_supp_mask.mean()
+                    mask_multiplier = mask_multiplier * face_supp_mask
+                else:
+                    print("WARNING: face_suppression_weight is set but no face bboxes available. "
+                          "Enable face_id or ensure InsightFace face detection is running.")
+
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):
                 # training a t2i adapter, not using as assistant.
@@ -1617,6 +3454,54 @@ class SDTrainer(BaseSDTrainProcess):
 
                 # flush()
                 pred_kwargs = {}
+
+                # LoRA+ID: project face embeddings and add to prediction kwargs
+                if self.face_id_projector is not None and batch.face_embedding is not None:
+                    face_emb = batch.face_embedding.to(self.device_torch, dtype=self.face_id_projector.norm.weight.dtype)
+                    face_tokens = self.face_id_projector(face_emb)
+
+                    # Vision face projection (CLIP/DINOv2 spatial tokens)
+                    vision_tokens = None
+                    if self.vision_face_projector is not None and batch.vision_face_embedding is not None:
+                        vision_emb = batch.vision_face_embedding.to(
+                            self.device_torch,
+                            dtype=self.vision_face_projector.resampler.proj_in.weight.dtype,
+                        )
+                        vision_tokens = self.vision_face_projector(vision_emb)
+                        # Log vision token norm before dropout
+                        self._last_vision_token_norm = vision_tokens.detach().float().norm(dim=-1).mean().item()
+
+                    # Body shape projection (SMPL betas)
+                    body_tokens = None
+                    if self.body_id_projector is not None and batch.body_embedding is not None:
+                        body_emb = batch.body_embedding.to(
+                            self.device_torch,
+                            dtype=self.body_id_projector.norm.weight.dtype,
+                        )
+                        body_tokens = self.body_id_projector(body_emb)
+                        self._last_body_token_norm = body_tokens.detach().float().norm(dim=-1).mean().item()
+
+                    # Synchronized dropout (same mask for all identity tokens)
+                    if self.face_id_config.dropout_prob > 0:
+                        drop_mask = (torch.rand(face_tokens.shape[0], 1, 1, device=face_tokens.device) > self.face_id_config.dropout_prob).float()
+                        face_tokens = face_tokens * drop_mask
+                        if vision_tokens is not None:
+                            vision_tokens = vision_tokens * drop_mask
+                        if body_tokens is not None:
+                            body_tokens = body_tokens * drop_mask
+
+                    # Concatenate all identity tokens
+                    token_parts = [face_tokens]
+                    if vision_tokens is not None:
+                        token_parts.append(vision_tokens)
+                    if body_tokens is not None:
+                        token_parts.append(body_tokens)
+                    all_face_tokens = torch.cat(token_parts, dim=1) if len(token_parts) > 1 else face_tokens
+
+                    pred_kwargs['face_tokens'] = all_face_tokens
+                    # mean per-token L2 norm (batch-size invariant)
+                    per_token_norms = face_tokens.detach().float().norm(dim=-1)  # (B, num_tokens)
+                    self._last_face_token_norm = per_token_norms.mean().item()
 
                 if has_adapter_img:
                     if (self.adapter and isinstance(self.adapter, T2IAdapter)) or (
@@ -1984,6 +3869,62 @@ class SDTrainer(BaseSDTrainProcess):
                             prior_pred=prior_to_calculate_loss,
                         )
                     
+                    # --- Pure-noise identity monitoring (no gradients, just tracking) ---
+                    if (self.id_loss_model is not None
+                            and batch.identity_embedding is not None
+                            and self.step_num % 10 == 0):
+                        with torch.no_grad():
+                            pure_z = torch.randn_like(noisy_latents)
+                            pure_t = torch.tensor([990.0], device=self.device_torch).expand(pure_z.shape[0])
+                            # predict with text only, NO face tokens
+                            pure_kwargs = {k: v for k, v in pred_kwargs.items() if k != 'face_tokens'}
+                            pure_v = self.predict_noise(
+                                noisy_latents=pure_z.to(self.device_torch, dtype=dtype),
+                                timesteps=pure_t,
+                                conditional_embeds=conditional_embeds.to(self.device_torch, dtype=dtype),
+                                unconditional_embeds=unconditional_embeds,
+                                batch=batch,
+                                **pure_kwargs
+                            )
+                            if self.sd.is_flow_matching:
+                                pure_x0 = pure_z - 0.99 * pure_v
+                            else:
+                                # DDPM: recover x0 at t=990
+                                _pn_acp = self.sd.noise_scheduler.alphas_cumprod.to(
+                                    device=pure_z.device, dtype=pure_z.dtype
+                                )
+                                _pn_ab = _pn_acp[990]
+                                _pn_sab = _pn_ab.sqrt()
+                                _pn_s1mab = (1.0 - _pn_ab).sqrt()
+                                if self.sd.prediction_type == 'v_prediction':
+                                    pure_x0 = _pn_sab * pure_z - _pn_s1mab * pure_v
+                                else:
+                                    pure_x0 = (pure_z - _pn_s1mab * pure_v) / _pn_sab.clamp(min=1e-8)
+                            # decode through TAEF2/TAESD
+                            if hasattr(self, '_taef2_decoder') and self._taef2_decoder is not None:
+                                pn_decode = pure_x0
+                                if pn_decode.shape[1] != 32:
+                                    from einops import rearrange
+                                    pn_decode = rearrange(pn_decode, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=32, p1=2, p2=2)
+                                dec_dtype = next(self._taef2_decoder.parameters()).dtype
+                                pn_pixels = self._taef2_decoder(pn_decode.to(dec_dtype)).float().clamp(0, 1)
+                            elif self.taesd is not None:
+                                taesd_dtype = next(self.taesd.parameters()).dtype
+                                pn_pixels = self.taesd.decode(pure_x0.to(taesd_dtype)).sample.float()
+                                pn_pixels = ((pn_pixels + 1.0) * 0.5).clamp(0, 1)
+                            else:
+                                pn_pixels = None
+                            if pn_pixels is not None:
+                                pn_emb = self.id_loss_model(pn_pixels)
+                                ref_emb = batch.identity_embedding.to(pn_emb.device, dtype=pn_emb.dtype)
+                                pn_cos = F.cosine_similarity(pn_emb, ref_emb, dim=-1).mean().item()
+                                self._last_pure_noise_cos = pn_cos
+                                # save preview
+                                pn_preview_dir = os.path.join(self.save_root, 'pure_noise_previews')
+                                os.makedirs(pn_preview_dir, exist_ok=True)
+                                img = TF.to_pil_image(pn_pixels[0].clamp(0, 1).cpu())
+                                img.save(os.path.join(pn_preview_dir, f'step{self.step_num:06d}_cos{pn_cos:.3f}.jpg'))
+
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
                         # send the loss backwards otherwise checkpointing will fail
                         self.accelerator.backward(loss)
@@ -2068,14 +4009,18 @@ class SDTrainer(BaseSDTrainProcess):
                 torch.cuda.empty_cache()
 
 
+        grad_norm = None
         if not self.is_grad_accumulation_step:
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
+                    total_norm_sq = 0.0
                     for i in range(len(self.params)):
-                        self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
+                        norm = self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
+                        total_norm_sq += norm.item() ** 2
+                    grad_norm = total_norm_sq ** 0.5
                 else:
-                    self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                    grad_norm = self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm).item()
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
@@ -2106,6 +4051,147 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+        if grad_norm is not None:
+            loss_dict['grad_norm'] = grad_norm
+
+        # LoRA+ID: log face token norm
+        if hasattr(self, '_last_face_token_norm') and self._last_face_token_norm is not None:
+            loss_dict['face_token_norm'] = self._last_face_token_norm
+            self._last_face_token_norm = None
+
+        # Vision token norm (CLIP/DINOv2 face crop tokens)
+        if hasattr(self, '_last_vision_token_norm') and self._last_vision_token_norm is not None:
+            loss_dict['vision_token_norm'] = self._last_vision_token_norm
+            self._last_vision_token_norm = None
+
+        # Body token norm (SMPL betas)
+        if hasattr(self, '_last_body_token_norm') and self._last_body_token_norm is not None:
+            loss_dict['body_token_norm'] = self._last_body_token_norm
+            self._last_body_token_norm = None
+
+        # Identity loss (auxiliary face similarity loss)
+        if self._last_identity_loss is not None:
+            loss_dict['identity_loss'] = self._last_identity_loss
+            self._last_identity_loss = None
+        # Landmark loss (auxiliary face shape loss)
+        if self._last_landmark_loss is not None:
+            loss_dict['landmark_loss'] = self._last_landmark_loss
+            self._last_landmark_loss = None
+        if self._last_pure_noise_cos is not None:
+            loss_dict['pure_noise_cos'] = self._last_pure_noise_cos
+            self._last_pure_noise_cos = None
+        if self._last_diffusion_loss is not None:
+            loss_dict['diffusion_loss'] = self._last_diffusion_loss
+            self._last_diffusion_loss = None
+        if self._last_diffusion_loss_applied is not None:
+            loss_dict['diffusion_loss_applied'] = self._last_diffusion_loss_applied
+            self._last_diffusion_loss_applied = None
+        if self._last_identity_loss_applied is not None:
+            loss_dict['identity_loss_applied'] = self._last_identity_loss_applied
+            self._last_identity_loss_applied = None
+        if self._last_landmark_loss_applied is not None:
+            loss_dict['landmark_loss_applied'] = self._last_landmark_loss_applied
+            self._last_landmark_loss_applied = None
+        # Body proportion loss (auxiliary body shape loss)
+        if self._last_body_proportion_loss is not None:
+            loss_dict['body_proportion_loss'] = self._last_body_proportion_loss
+            self._last_body_proportion_loss = None
+        if self._last_body_proportion_loss_applied is not None:
+            loss_dict['body_proportion_loss_applied'] = self._last_body_proportion_loss_applied
+            self._last_body_proportion_loss_applied = None
+        if self._last_bp_sim_bins is not None:
+            for bin_key, sim_val in self._last_bp_sim_bins.items():
+                loss_dict[bin_key] = sim_val
+            self._last_bp_sim_bins = None
+        # Body shape loss (HybrIK SMPL betas)
+        if self._last_body_shape_loss is not None:
+            loss_dict['body_shape_loss'] = self._last_body_shape_loss
+            self._last_body_shape_loss = None
+        if self._last_body_shape_loss_applied is not None:
+            loss_dict['body_shape_loss_applied'] = self._last_body_shape_loss_applied
+            self._last_body_shape_loss_applied = None
+        if self._last_body_shape_cos is not None:
+            loss_dict['body_shape_cos'] = self._last_body_shape_cos
+            self._last_body_shape_cos = None
+        if self._last_body_shape_l1 is not None:
+            loss_dict['body_shape_l1'] = self._last_body_shape_l1
+            self._last_body_shape_l1 = None
+        if self._last_body_shape_gated_pct is not None:
+            loss_dict['body_shape_gated_pct'] = self._last_body_shape_gated_pct
+            self._last_body_shape_gated_pct = None
+        if self._last_bsh_sim_bins is not None:
+            for bin_key, sim_val in self._last_bsh_sim_bins.items():
+                loss_dict[bin_key] = sim_val
+            self._last_bsh_sim_bins = None
+        # Normal loss (Sapiens surface normals)
+        if self._last_normal_loss is not None:
+            loss_dict['normal_loss'] = self._last_normal_loss
+            self._last_normal_loss = None
+        if self._last_normal_loss_applied is not None:
+            loss_dict['normal_loss_applied'] = self._last_normal_loss_applied
+            self._last_normal_loss_applied = None
+        if self._last_normal_cos is not None:
+            loss_dict['normal_cos'] = self._last_normal_cos
+            self._last_normal_cos = None
+        # VAE anchor loss (perceptual feature matching)
+        if self._last_vae_anchor_loss is not None:
+            loss_dict['vae_anchor_loss'] = self._last_vae_anchor_loss
+            self._last_vae_anchor_loss = None
+        if self._last_vae_anchor_loss_applied is not None:
+            loss_dict['vae_anchor_loss_applied'] = self._last_vae_anchor_loss_applied
+            self._last_vae_anchor_loss_applied = None
+        if self._last_vae_anchor_per_level is not None:
+            for level_name, level_val in self._last_vae_anchor_per_level.items():
+                loss_dict[f'va_{level_name}'] = level_val
+            self._last_vae_anchor_per_level = None
+        if self._last_timestep is not None:
+            loss_dict['timestep'] = self._last_timestep
+            self._last_timestep = None
+        if self._last_id_sim is not None:
+            loss_dict['id_sim'] = self._last_id_sim
+            self._last_id_sim = None
+        if self._last_id_clean_target is not None:
+            loss_dict['id_clean_target'] = self._last_id_clean_target
+            self._last_id_clean_target = None
+        if self._last_id_shortfall is not None:
+            loss_dict['id_shortfall'] = self._last_id_shortfall
+            self._last_id_shortfall = None
+        if self._last_id_sim_bins is not None:
+            for bin_key, sim_val in self._last_id_sim_bins.items():
+                loss_dict[bin_key] = sim_val
+            self._last_id_sim_bins = None
+        if self._last_shape_sim_bins is not None:
+            for bin_key, sim_val in self._last_shape_sim_bins.items():
+                loss_dict[bin_key] = sim_val
+            self._last_shape_sim_bins = None
+
+        # E-LatentLPIPS perceptual loss metrics
+        if self.latent_perceptual_model is not None and self._latent_perceptual_accumulation_count > 0:
+            n = self._latent_perceptual_accumulation_count
+            loss_dict['latent_perceptual_loss'] = self._latent_perceptual_loss_accumulator / n
+            loss_dict['latent_perceptual_loss_applied'] = self._latent_perceptual_loss_applied_accumulator / n
+
+            preview_every = self.train_config.latent_perceptual_preview_every
+            if preview_every > 0 and self.step_num % preview_every == 0 and self._lp_preview_cache is not None:
+                try:
+                    self._save_latent_perceptual_preview(
+                        noise_pred=self._lp_preview_cache['noise_pred'],
+                        noisy_latents=self._lp_preview_cache['noisy_latents'],
+                        timesteps=self._lp_preview_cache['timesteps'],
+                        batch_latents=self._lp_preview_cache['batch_latents'],
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to save latent perceptual preview: {e}")
+
+            self._latent_perceptual_loss_accumulator = 0.0
+            self._latent_perceptual_loss_applied_accumulator = 0.0
+            self._latent_perceptual_accumulation_count = 0
+            self._lp_preview_cache = None
+
+        # Text token norm (reference for face_token_norm comparison)
+        if hasattr(self.sd, 'unet') and hasattr(self.sd.unet, '_last_txt_token_norm'):
+            loss_dict['txt_token_norm'] = self.sd.unet._last_txt_token_norm
+            self.sd.unet._last_txt_token_norm = None
 
         self.end_of_training_loop()
 

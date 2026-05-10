@@ -107,6 +107,31 @@ export interface DatasetConfig {
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
+  // Per-dataset loss overrides (undefined = inherit global face_id config)
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
+  landmark_loss_weight?: number;
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
+  body_proportion_include_head?: boolean;
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  body_shape_loss_min_cos?: number;
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
+  diffusion_loss_weight?: number;
+  face_suppression_weight?: number;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
 }
 
 export interface EMAConfig {
@@ -144,6 +169,14 @@ export interface TrainConfig {
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
+  diffusion_loss_weight?: number;
+  diffusion_loss_min_t?: number;
+  diffusion_loss_max_t?: number;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
+  latent_perceptual_encoder?: string;
+  latent_perceptual_preview_every?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
@@ -217,6 +250,53 @@ export interface SliderConfig {
   anchor_class?: string | null;
 }
 
+export interface FaceIDConfig {
+  enabled: boolean;
+  num_tokens: number;
+  dropout_prob: number;
+  face_model: string;
+  scale_lr_multiplier: number;
+  init_scale: number;
+  vision_enabled?: boolean;
+  vision_model?: string;
+  vision_num_tokens?: number;
+  vision_crop_padding?: number;
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
+  identity_loss_use_average?: boolean;
+  identity_loss_average_blend?: number;
+  identity_loss_use_random?: boolean;
+  identity_loss_num_refs?: number;
+  identity_metrics?: boolean;
+  landmark_loss_weight?: number;
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
+  body_proportion_include_head?: boolean;
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
+  vae_anchor_model_path?: string;
+  face_suppression_weight?: number;
+}
+
+export interface BodyIDConfig {
+  enabled: boolean;
+  num_tokens: number;
+  dropout_prob: number;
+  detection_threshold: number;
+  scale_lr_multiplier: number;
+  init_scale: number;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -226,6 +306,8 @@ export interface ProcessConfig {
   device: string;
   network?: NetworkConfig;
   slider?: SliderConfig;
+  face_id?: FaceIDConfig;
+  body_id?: BodyIDConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];
   train: TrainConfig;

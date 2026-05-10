@@ -735,18 +735,23 @@ export const modelArchs: ModelArch[] = [
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 }) as any;
 
-export const groupedModelOptions: GroupedSelectOption[] = modelArchs.reduce((acc, arch) => {
-  const group = acc.find(g => g.label === arch.group);
-  if (group) {
-    group.options.push({ value: arch.name, label: arch.label });
-  } else {
-    acc.push({
-      label: arch.group,
-      options: [{ value: arch.name, label: arch.label }],
-    });
-  }
-  return acc;
-}, [] as GroupedSelectOption[]);
+// Only expose supported models in the UI selector
+const enabledModelNames = new Set(['sdxl', 'flux2_klein_9b']);
+
+export const groupedModelOptions: GroupedSelectOption[] = modelArchs
+  .filter(arch => enabledModelNames.has(arch.name))
+  .reduce((acc, arch) => {
+    const group = acc.find(g => g.label === arch.group);
+    if (group) {
+      group.options.push({ value: arch.name, label: arch.label });
+    } else {
+      acc.push({
+        label: arch.group,
+        options: [{ value: arch.name, label: arch.label }],
+      });
+    }
+    return acc;
+  }, [] as GroupedSelectOption[]);
 
 export const quantizationOptions: SelectOption[] = [
   { value: '', label: '- NONE -' },

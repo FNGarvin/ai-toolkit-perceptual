@@ -398,6 +398,10 @@ class TrainConfig:
         self.target_noise_multiplier = kwargs.get('target_noise_multiplier', 1.0)
         self.random_noise_multiplier = kwargs.get('random_noise_multiplier', 0.0)
         self.do_signal_correction_noise = kwargs.get('do_signal_correction_noise', False)
+        # batch noise correction adds other images in the batch as noise to correct away from other images
+        self.do_batch_noise_correction = kwargs.get('do_batch_noise_correction', False)
+        self.batch_noise_correction_scale = kwargs.get('batch_noise_correction_scale', 0.1)
+        
         self.signal_correction_noise_scale = kwargs.get('signal_correction_noise_scale', 1.0)
         self.random_noise_shift = kwargs.get('random_noise_shift', 0.0)
         self.img_multiplier = kwargs.get('img_multiplier', 1.0)
@@ -491,6 +495,9 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow
+        self.diffusion_loss_weight: float = kwargs.get('diffusion_loss_weight', 1.0)
+        self.diffusion_loss_min_t: float = kwargs.get('diffusion_loss_min_t', 0.0)
+        self.diffusion_loss_max_t: float = kwargs.get('diffusion_loss_max_t', 1.0)
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
@@ -563,6 +570,13 @@ class TrainConfig:
 
         # stabilizes empty prompts to be zeroed predictions
         self.do_blank_stabilization = kwargs.get('do_blank_stabilization', False)
+
+        # E-LatentLPIPS perceptual loss in latent space
+        self.latent_perceptual_loss_weight: float = kwargs.get('latent_perceptual_loss_weight', 0.0)
+        self.latent_perceptual_loss_min_t: float = kwargs.get('latent_perceptual_loss_min_t', 0.0)
+        self.latent_perceptual_loss_max_t: float = kwargs.get('latent_perceptual_loss_max_t', 0.5)
+        self.latent_perceptual_encoder: str = kwargs.get('latent_perceptual_encoder', 'auto')
+        self.latent_perceptual_preview_every: int = kwargs.get('latent_perceptual_preview_every', 500)
 
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
@@ -832,6 +846,76 @@ class SliderConfig:
 
 ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask']
 
+
+class FaceIDConfig:
+    """Configuration for LoRA+ID face-conditioned training."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.num_tokens: int = kwargs.get('num_tokens', 4)
+        self.dropout_prob: float = kwargs.get('dropout_prob', 0.1)
+        self.face_model: str = kwargs.get('face_model', 'buffalo_l')
+        self.scale_lr_multiplier: float = kwargs.get('scale_lr_multiplier', 10.0)
+        self.init_scale: float = kwargs.get('init_scale', 0.01)
+        # Vision encoder (CLIP/DINOv2) for fine-grained face detail
+        self.vision_enabled: bool = kwargs.get('vision_enabled', False)
+        self.vision_model: str = kwargs.get('vision_model', 'openai/clip-vit-large-patch14')
+        self.vision_num_tokens: int = kwargs.get('vision_num_tokens', 4)
+        self.vision_crop_padding: float = kwargs.get('vision_crop_padding', 0.3)
+        # Auxiliary identity loss via TAESD-decoded x0 predictions
+        self.identity_loss_weight: float = kwargs.get('identity_loss_weight', 0.0)  # 0 = disabled
+        self.identity_loss_min_t: float = kwargs.get('identity_loss_min_t', 0.0)
+        self.identity_loss_max_t: float = kwargs.get('identity_loss_max_t', 1.0)
+        # Minimum cosine similarity to apply face losses (prevents hallucinating faces)
+        self.identity_loss_min_cos: float = kwargs.get('identity_loss_min_cos', 0.2)
+        # Use per-dataset average face embedding instead of per-image embedding
+        self.identity_loss_use_average: bool = kwargs.get('identity_loss_use_average', True)
+        # Blend per-image embedding with dataset average (0.0=per-image only, 0.5=midpoint, 1.0=pure average)
+        self.identity_loss_average_blend: float = kwargs.get('identity_loss_average_blend', 0.0)
+        # Use a random face embedding from the dataset each step instead of the image's own
+        self.identity_loss_use_random: bool = kwargs.get('identity_loss_use_random', False)
+        # Compare against K random embeddings from dataset, use best match (0 = disabled)
+        self.identity_loss_num_refs: int = kwargs.get('identity_loss_num_refs', 0)
+        # Track identity metrics even when identity_loss_weight is 0
+        self.identity_metrics: bool = kwargs.get('identity_metrics', False)
+        # Auxiliary landmark shape loss via MediaPipe FaceMesh landmarks
+        self.landmark_loss_weight: float = kwargs.get('landmark_loss_weight', 0.0)  # 0 = disabled
+        # Auxiliary body proportion loss via MediaPipe BlazePose bone-length ratios
+        self.body_proportion_loss_weight: float = kwargs.get('body_proportion_loss_weight', 0.0)  # 0 = disabled
+        self.body_proportion_loss_min_t: float = kwargs.get('body_proportion_loss_min_t', 0.0)
+        self.body_proportion_loss_max_t: float = kwargs.get('body_proportion_loss_max_t', 1.0)
+        self.body_proportion_include_head: bool = kwargs.get('body_proportion_include_head', False)
+        # Auxiliary body shape loss via HybrIK SMPL beta prediction
+        self.body_shape_loss_weight: float = kwargs.get('body_shape_loss_weight', 0.0)  # 0 = disabled
+        self.body_shape_loss_min_t: float = kwargs.get('body_shape_loss_min_t', 0.4)
+        self.body_shape_loss_max_t: float = kwargs.get('body_shape_loss_max_t', 0.8)
+        self.body_shape_loss_min_cos: float = kwargs.get('body_shape_loss_min_cos', 0.2)
+        # Auxiliary normal map loss via Sapiens surface normal estimation
+        self.normal_loss_weight: float = kwargs.get('normal_loss_weight', 0.0)  # 0 = disabled
+        self.normal_loss_min_t: float = kwargs.get('normal_loss_min_t', 0.4)
+        self.normal_loss_max_t: float = kwargs.get('normal_loss_max_t', 0.8)
+        # Face suppression: downweight diffusion loss in detected face bounding boxes
+        # None = no suppression, 0.0 = zero face loss, 0.5 = half, 1.0 = normal
+        self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        # VAE perceptual anchor loss — compare x0_pred VAE encoder features vs reference
+        self.vae_anchor_loss_weight: float = kwargs.get('vae_anchor_loss_weight', 0.0)  # 0 = disabled
+        self.vae_anchor_loss_min_t: float = kwargs.get('vae_anchor_loss_min_t', 0.0)
+        self.vae_anchor_loss_max_t: float = kwargs.get('vae_anchor_loss_max_t', 0.5)
+        self.vae_anchor_model_path: str = kwargs.get('vae_anchor_model_path', '')  # path to VAE safetensors
+
+
+class BodyIDConfig:
+    """Configuration for body-shape-conditioned training via SMPL betas."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.num_tokens: int = kwargs.get('num_tokens', 4)
+        self.dropout_prob: float = kwargs.get('dropout_prob', 0.1)
+        self.detection_threshold: float = kwargs.get('detection_threshold', 0.5)
+        self.scale_lr_multiplier: float = kwargs.get('scale_lr_multiplier', 10.0)
+        self.init_scale: float = kwargs.get('init_scale', 0.01)
+
+
 class DatasetConfig:
     """
     Dataset config for sd-datasets
@@ -950,6 +1034,31 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+
+        # Per-dataset loss weight overrides (None = use global config value)
+        self.identity_loss_weight: Union[float, None] = kwargs.get('identity_loss_weight', None)
+        self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
+        self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
+        self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+        self.landmark_loss_weight: Union[float, None] = kwargs.get('landmark_loss_weight', None)
+        self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
+        self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
+        self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)
+        self.body_shape_loss_weight: Union[float, None] = kwargs.get('body_shape_loss_weight', None)
+        self.body_shape_loss_min_t: Union[float, None] = kwargs.get('body_shape_loss_min_t', None)
+        self.body_shape_loss_max_t: Union[float, None] = kwargs.get('body_shape_loss_max_t', None)
+        self.body_shape_loss_min_cos: Union[float, None] = kwargs.get('body_shape_loss_min_cos', None)
+        self.normal_loss_weight: Union[float, None] = kwargs.get('normal_loss_weight', None)
+        self.normal_loss_min_t: Union[float, None] = kwargs.get('normal_loss_min_t', None)
+        self.normal_loss_max_t: Union[float, None] = kwargs.get('normal_loss_max_t', None)
+        self.vae_anchor_loss_weight: Union[float, None] = kwargs.get('vae_anchor_loss_weight', None)
+        self.vae_anchor_loss_min_t: Union[float, None] = kwargs.get('vae_anchor_loss_min_t', None)
+        self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
+        self.diffusion_loss_weight: Union[float, None] = kwargs.get('diffusion_loss_weight', None)
+        self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
+        self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
+        self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

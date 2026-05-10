@@ -424,6 +424,11 @@ class Flux2Model(BaseModel):
 
             cast_dtype = self.model.dtype
 
+        # LoRA+ID: pass face tokens if provided
+        face_tokens = kwargs.get('face_tokens', None)
+        if face_tokens is not None:
+            face_tokens = face_tokens.to(self.device_torch, cast_dtype)
+
         packed_noise_pred = self.transformer(
             x=img_input.to(self.device_torch, cast_dtype),
             x_ids=img_input_ids.to(self.device_torch),
@@ -431,6 +436,7 @@ class Flux2Model(BaseModel):
             ctx=txt.to(self.device_torch, cast_dtype),
             ctx_ids=txt_ids.to(self.device_torch),
             guidance=guidance_vec.to(self.device_torch, cast_dtype),
+            face_tokens=face_tokens,
         )
 
         if img_cond_seq is not None:

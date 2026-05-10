@@ -551,6 +551,81 @@ export default function SimpleJob({
                     { value: 'stepped', label: 'Stepped Recovery' },
                   ]}
                 />
+                <NumberInput
+                  label="Diffusion Loss Weight"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.diffusion_loss_weight ?? 1.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.diffusion_loss_weight')
+                  }
+                  placeholder="1.0 = normal"
+                  min={0}
+                  max={1}
+                />
+                {(jobConfig.config.process[0].train.diffusion_loss_weight ?? 1.0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Diffusion Loss Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.diffusion_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.diffusion_loss_min_t')
+                      }
+                      placeholder="0.0 = all timesteps"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Diffusion Loss Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.diffusion_loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.diffusion_loss_max_t')
+                      }
+                      placeholder="1.0 = all timesteps"
+                      min={0}
+                      max={1}
+                    />
+                  </>
+                )}
+                {/* Latent perceptual loss — experimental, hidden for now
+                <NumberInput
+                  label="Latent Perceptual Loss Weight"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.latent_perceptual_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].train.latent_perceptual_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Latent Perceptual Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.latent_perceptual_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_min_t')
+                      }
+                      placeholder="0.0"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Latent Perceptual Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.latent_perceptual_loss_max_t ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_max_t')
+                      }
+                      placeholder="0.5"
+                      min={0}
+                      max={1}
+                    />
+                  </>
+                )}
+                */}
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                   <NumberInput
                     label="Audio Loss Multiplier"
@@ -690,6 +765,455 @@ export default function SimpleJob({
                     )}
                   </>
                 )}
+                <FormGroup label="Perceptual Anchoring" docKey="perceptual_anchoring">
+                  <></>
+                </FormGroup>
+                {/* Face ID Conditioning — hidden for now, available via YAML config
+                <Checkbox
+                  label="Face ID Conditioning"
+                  docKey="face_id.enabled"
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].face_id?.enabled || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].face_id.enabled');
+                  }}
+                />
+                {jobConfig.config.process[0].face_id?.enabled && (
+                  <>
+                    <NumberInput
+                      label="Face Tokens"
+                      docKey="face_id.num_tokens"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.num_tokens || 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.num_tokens')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={16}
+                    />
+                    <NumberInput
+                      label="Face Dropout"
+                      docKey="face_id.dropout_prob"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.dropout_prob || 0.1}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.dropout_prob')
+                      }
+                      placeholder="eg. 0.1"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Scale LR Multiplier"
+                      docKey="face_id.scale_lr_multiplier"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.scale_lr_multiplier || 10}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.scale_lr_multiplier')
+                      }
+                      placeholder="eg. 10"
+                      min={1}
+                      max={100}
+                    />
+                    <NumberInput
+                      label="Init Scale"
+                      docKey="face_id.init_scale"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.init_scale || 0.01}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.init_scale')
+                      }
+                      placeholder="eg. 0.01"
+                      min={0.001}
+                      max={1000}
+                    />
+                    <Checkbox
+                      label="Vision Face Embeddings (CLIP/DINOv2)"
+                      docKey="face_id.vision_enabled"
+                      className="pt-3"
+                      checked={jobConfig.config.process[0].face_id?.vision_enabled || false}
+                      onChange={value => {
+                        setJobConfig(value, 'config.process[0].face_id.vision_enabled');
+                      }}
+                    />
+                    {jobConfig.config.process[0].face_id?.vision_enabled && (
+                      <>
+                        <SelectInput
+                          label="Vision Model"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].face_id?.vision_model || 'openai/clip-vit-large-patch14'}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].face_id.vision_model')
+                          }
+                          options={[
+                            { label: 'CLIP ViT-L/14', value: 'openai/clip-vit-large-patch14' },
+                            { label: 'DINOv2 Large', value: 'facebook/dinov2-large' },
+                          ]}
+                        />
+                        <NumberInput
+                          label="Vision Tokens"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].face_id?.vision_num_tokens || 4}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].face_id.vision_num_tokens')
+                          }
+                          placeholder="eg. 4"
+                          min={1}
+                          max={16}
+                        />
+                      </>
+                    )}
+                  </>
+                )}
+                */}
+                <Checkbox
+                  label="Identity Metrics (track without loss)"
+                  docKey="face_id.identity_metrics"
+                  className="pt-3"
+                  checked={jobConfig.config.process[0].face_id?.identity_metrics || false}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.identity_metrics')
+                  }
+                />
+                <NumberInput
+                  label="Identity Loss Weight"
+                  docKey="face_id.identity_loss_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.identity_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Identity Loss Min t"
+                      docKey="face_id.identity_loss_min_t"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_min_t ?? 0.0
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_min_t'
+                        )
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Identity Loss Max t"
+                      docKey="face_id.identity_loss_max_t"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_max_t ?? 1.0
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_max_t'
+                        )
+                      }
+                      placeholder="eg. 1"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Identity Loss Min Cosine"
+                      docKey="face_id.identity_loss_min_cos"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_min_cos ?? 0.2
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_min_cos'
+                        )
+                      }
+                      placeholder="0.2 = only apply when face detected"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <Checkbox
+                      label="Use Average Face Embedding"
+                      docKey="face_id.identity_loss_use_average"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.identity_loss_use_average || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_use_average')
+                      }
+                    />
+                    <NumberInput
+                      label="Average Blend (0=per-image, 0.5=midpoint, 1=average)"
+                      docKey="face_id.identity_loss_average_blend"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.identity_loss_average_blend ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_average_blend')
+                      }
+                      placeholder="0 = per-image only"
+                      min={0}
+                      max={1}
+                    />
+                    <Checkbox
+                      label="Use Random Face Embedding Per Step"
+                      docKey="face_id.identity_loss_use_random"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.identity_loss_use_random || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_use_random')
+                      }
+                    />
+                    <NumberInput
+                      label="Multi-Ref Count (0 = disabled)"
+                      docKey="face_id.identity_loss_num_refs"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.identity_loss_num_refs ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_num_refs')
+                      }
+                      placeholder="0 = use single ref"
+                      min={0}
+                    />
+                  </>
+                )}
+                {/* Landmark loss — experimental, hidden for now
+                <NumberInput
+                  label="Landmark Loss Weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.landmark_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.landmark_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                */}
+                <NumberInput
+                  label="Body Proportion Loss Weight"
+                  docKey="face_id.body_proportion_loss_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Body Proportion Min t"
+                      docKey="face_id.body_proportion_loss_min_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_proportion_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Body Proportion Max t"
+                      docKey="face_id.body_proportion_loss_max_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_proportion_loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_max_t')
+                      }
+                      placeholder="eg. 1"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="Face Suppression Weight"
+                  docKey="face_id.face_suppression_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.face_suppression_weight ?? null}
+                  onChange={value =>
+                    setJobConfig(value === null || value === undefined ? undefined : value, 'config.process[0].face_id.face_suppression_weight')
+                  }
+                  placeholder="none (no suppression)"
+                  min={0}
+                  max={1}
+                />
+                {/* Body shape, normal map, VAE anchor, body conditioning — experimental, hidden for now
+                <NumberInput
+                  label="Body Shape Loss Weight (HybrIK)"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.body_shape_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.body_shape_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.body_shape_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Body Shape Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_shape_loss_min_t ?? 0.4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_shape_loss_min_t')
+                      }
+                      placeholder="eg. 0.4"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Body Shape Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_shape_loss_max_t ?? 0.8}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_shape_loss_max_t')
+                      }
+                      placeholder="eg. 0.8"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="Normal Map Loss Weight (Sapiens)"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.normal_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.normal_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.normal_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Normal Loss Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.normal_loss_min_t ?? 0.4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.normal_loss_min_t')
+                      }
+                      placeholder="eg. 0.4"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Normal Loss Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.normal_loss_max_t ?? 0.8}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.normal_loss_max_t')
+                      }
+                      placeholder="eg. 0.8"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="VAE Anchor Loss Weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.vae_anchor_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.vae_anchor_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="VAE Anchor Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.vae_anchor_loss_min_t ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="VAE Anchor Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.vae_anchor_loss_max_t ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_max_t')
+                      }
+                      placeholder="eg. 0.5"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                */}
+                {/* Body Shape Conditioning (SMPL) — experimental, hidden for now
+                <Checkbox
+                  label="Body Shape Conditioning (SMPL)"
+                  className="pt-3"
+                  checked={jobConfig.config.process[0].body_id?.enabled || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].body_id.enabled');
+                  }}
+                />
+                {jobConfig.config.process[0].body_id?.enabled && (
+                  <>
+                    <NumberInput
+                      label="Body Tokens"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.num_tokens || 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.num_tokens')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={16}
+                    />
+                    <NumberInput
+                      label="Body Dropout"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.dropout_prob || 0.1}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.dropout_prob')
+                      }
+                      placeholder="eg. 0.1"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Scale LR Multiplier"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.scale_lr_multiplier || 10}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.scale_lr_multiplier')
+                      }
+                      placeholder="eg. 10"
+                      min={1}
+                      max={100}
+                    />
+                    <NumberInput
+                      label="Init Scale"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.init_scale || 0.01}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.init_scale')
+                      }
+                      placeholder="eg. 0.01"
+                      min={0.001}
+                      max={1000}
+                    />
+                  </>
+                )}
+                */}
               </div>
             </div>
           </Card>
@@ -972,6 +1496,91 @@ export default function SimpleJob({
                       </FormGroup>
                     </div>
                   </div>
+                  {/* Per-dataset perceptual anchoring overrides — show when multiple datasets or any identity/body loss enabled */}
+                  {(jobConfig.config.process[0].datasets.length > 1 ||
+                    jobConfig.config.process[0].face_id?.enabled ||
+                    (jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0) > 0 ||
+                    (jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0) > 0) && (
+                    <details className="mt-3">
+                      <summary className="cursor-pointer text-sm text-gray-400 hover:text-gray-200">
+                        Per-Dataset Perceptual Anchoring Overrides
+                      </summary>
+                      <div className="mt-2 space-y-3 p-3 rounded bg-gray-700/50">
+                        {/* Diffusion */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Diffusion</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Latent Perceptual — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Latent Perceptual</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.latent_perceptual_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.latent_perceptual_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.latent_perceptual_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        */}
+                        {/* Identity */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Identity (ArcFace)</div>
+                          <div className="grid grid-cols-4 gap-2">
+                            <NumberInput label="Weight" value={dataset.identity_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.identity_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.identity_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.identity_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Landmark — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Landmark</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.landmark_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].landmark_loss_weight`)} placeholder="inherit" min={0} />
+                          </div>
+                        </div>
+                        */}
+                        {/* Body Proportion */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Body Proportion</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.body_proportion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_proportion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_proportion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Body Shape, Normal Map, VAE Anchor — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Body Shape</div>
+                          <div className="grid grid-cols-4 gap-2">
+                            <NumberInput label="Weight" value={dataset.body_shape_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_shape_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_shape_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.body_shape_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Normal Map</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.normal_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.normal_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.normal_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">VAE Anchor</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.vae_anchor_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.vae_anchor_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.vae_anchor_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        */}
+                      </div>
+                    </details>
+                  )}
                 </div>
               ))}
               <button
