@@ -57,6 +57,7 @@ RUN uv pip install --system --break-system-packages torch==2.9.1 torchvision==0.
 
 # Copy the repository into the image
 COPY . /app/ai-toolkit
+WORKDIR /app/ai-toolkit
 
 # Install Python dependencies
 RUN uv pip install --system --break-system-packages -r requirements.txt && \
